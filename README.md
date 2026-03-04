@@ -2,7 +2,7 @@
 
 [![Developed by Zelijah](https://img.shields.io/badge/Developed%20by-Zelijah-red?logo=github&logoColor=white)](https://thezelijah.world) ![GitHub Sponsors](https://img.shields.io/github/sponsors/jedlsf?style=plastic&label=Sponsors&link=https%3A%2F%2Fgithub.com%2Fsponsors%2Fjedlsf)
 
-**Majik File** is the core cryptographic engine of the [Majik Message](https://github.com/Majikah/majik-message) platform. It provides a post-quantum secure "envelope" format that handles message encryption, multi-recipient key encapsulation, and transparent compression using NIST-standardized algorithms.
+**Majik File** is the core cryptographic engine for secure file handling in the [Majik Message](https://github.com/Majikah/majik-message) ecosystem. It provides a **post-quantum secure "envelope" format** designed for file encryption, multi-recipient key encapsulation, and transparent compression using NIST-standardized algorithms.
 
 ![npm](https://img.shields.io/npm/v/@majikah/majik-file) ![npm downloads](https://img.shields.io/npm/dm/@majikah/majik-file) ![npm bundle size](https://img.shields.io/bundlephobia/min/%40majikah%2Fmajik-file) [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) ![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue)
 
@@ -40,20 +40,28 @@
 
 ## Overview
 
-Majik File implements **Envelope Format**, which exclusively uses **ML-KEM-768 (FIPS-203)** for post-quantum security. It abstracts away the complexity of managing shared secrets, AES-GCM initialization vectors, and multi-recipient key wrapping, allowing developers to focus on sending secure messages.
+**Majik File** implements a **File Envelope Format**, which uses **ML-KEM-768 (FIPS-203)** for **post-quantum secure key encapsulation**.  
+
+It abstracts the complexity of:  
+
+- Managing shared secrets  
+- AES-GCM initialization vectors  
+- Multi-recipient key wrapping  
+- File compression/decompression  
+
+This allows developers to **securely encrypt and share files with minimal cryptographic overhead**.
 
 ---
 
 ### Key Features
 
-- **Post-Quantum Security**: Exclusively uses ML-KEM-768 for key encapsulation.
-- **Hybrid Encryption**: Combines ML-KEM shared secrets with AES-256-GCM for high-speed content encryption.
-- **Group Messaging**: Native support for 1-to-many encryption using a single-ciphertext, multi-key-wrap approach.
-- **Transparent Compression**: Built-in Zstd and Gzip support via `MajikCompressor` to reduce message size.
-- **Strict Format**: Binary-backed envelopes with a standardized Base64 string representation (`~*$MJKMSG:`).
+- **Post-Quantum Security** – Exclusively uses ML-KEM-768 for key encapsulation.  
+- **Hybrid Encryption** – Combines ML-KEM shared secrets with AES-256-GCM for high-speed file encryption.  
+- **Group File Sharing** – Encrypt a file for multiple recipients with a single ciphertext and multiple key wraps.  
+- **Transparent Compression** – Built-in Zstd and Gzip support via `MajikCompressor` to reduce file size.  
+- **Strict Format** – Binary-backed envelopes with a standardized Base64 string representation (`~*$MJKFILE:`).  
 
 ---
-
 
 ## Installation
 
@@ -71,10 +79,13 @@ npm install @majikah/majik-file
 The library automatically chooses between "Single" and "Group" logic based on the number of recipients.
 
 ```ts
-import { MajikEnvelope } from "@majikah/majik-file";
+import { MajikFileEnvelope } from "@majikah/majik-file";
+import fs from "fs";
 
-const envelope = await MajikEnvelope.encrypt({
-  plaintext: "Hello, this is a quantum-safe secret.",
+const fileBuffer = fs.readFileSync("secret.pdf");
+
+const envelope = await MajikFileEnvelope.encrypt({
+  data: fileBuffer,
   recipients: [{
     fingerprint: "recipient_fingerprint_base64",
     mlKemPublicKey: recipientPublicKeyBytes // Uint8Array (1184 bytes)
@@ -82,9 +93,9 @@ const envelope = await MajikEnvelope.encrypt({
   compress: true // Default is true
 });
 
-// Convert to the scanner-ready string
+// Convert to scanner-ready string
 const secretString = envelope.toString(); 
-// Output: ~*$MJKMSG:AbC123...
+// Output: ~*$MJKFILE:AbC123...
 
 
 ```
@@ -147,13 +158,13 @@ try {
 ### 1. Cryptographic Stack (Envelope)
 Majik File is designed to be **Post-Quantum Secure (PQS)** by default, moving away from classical ECC for key encapsulation.
 
-| Component | Primitive | Implementation / Standard |
-| :--- | :--- | :--- |
-| **Key Encapsulation (KEM)** | ML-KEM-768 | FIPS-203 (formerly Kyber) |
-| **Symmetric Encryption** | AES-256-GCM | NIST SP 800-38D |
-| **Hashing / Fingerprinting**| SHA-256 | FIPS 180-4 |
-| **Key Derivation (KDF)** | Argon2id | OWASP Recommended (v2 accounts) |
-| **Compression** | Zstd / Gzip | `@bokuweb/zstd-wasm` / `fflate` |
+| Component                    | Primitive   | Implementation / Standard       |
+| :--------------------------- | :---------- | :------------------------------ |
+| **Key Encapsulation (KEM)**  | ML-KEM-768  | FIPS-203 (formerly Kyber)       |
+| **Symmetric Encryption**     | AES-256-GCM | NIST SP 800-38D                 |
+| **Hashing / Fingerprinting** | SHA-256     | FIPS 180-4                      |
+| **Key Derivation (KDF)**     | Argon2id    | OWASP Recommended (v2 accounts) |
+| **Compression**              | Zstd / Gzip | `@bokuweb/zstd-wasm` / `fflate` |
 
 
 ### 2. Binary Structure & Framing
@@ -162,21 +173,21 @@ The library produces a "Scanner-Ready" string. This is a Base64-encoded binary b
 **Format:** `~*$MJKMSG:<Base64_Payload>`
 
 #### Internal Binary Layout (Decoded Base64):
-| Offset (Bytes) | Length | Field | Description |
-| :--- | :--- | :--- | :--- |
-| `0` | 1 | **Version** | Set to `0x03` for current PQ format. |
-| `1` | 32 | **Fingerprint** | SHA-256 of the recipient (Single) or Sender (Group). |
-| `33` | Variable | **Payload** | UTF-8 JSON string containing IVs and ciphertexts. |
+| Offset (Bytes) | Length   | Field           | Description                                          |
+| :------------- | :------- | :-------------- | :--------------------------------------------------- |
+| `0`            | 1        | **Version**     | Set to `0x03` for current PQ format.                 |
+| `1`            | 32       | **Fingerprint** | SHA-256 of the recipient (Single) or Sender (Group). |
+| `33`           | Variable | **Payload**     | UTF-8 JSON string containing IVs and ciphertexts.    |
 
 
 ### 3. Primitive Parameters
-| Parameter | Value | Description |
-| :--- | :--- | :--- |
-| `ML_KEM_PK_LEN` | 1184 bytes | ML-KEM-768 Public Key size. |
-| `ML_KEM_SK_LEN` | 2400 bytes | ML-KEM-768 Secret Key size. |
-| `ML_KEM_CT_LEN` | 1088 bytes | ML-KEM-768 Ciphertext (encapsulation). |
-| `AES_KEY_LEN` | 32 bytes | 256-bit symmetric key. |
-| `IV_LENGTH` | 12 bytes | Standard GCM Initialization Vector length. |
+| Parameter       | Value      | Description                                |
+| :-------------- | :--------- | :----------------------------------------- |
+| `ML_KEM_PK_LEN` | 1184 bytes | ML-KEM-768 Public Key size.                |
+| `ML_KEM_SK_LEN` | 2400 bytes | ML-KEM-768 Secret Key size.                |
+| `ML_KEM_CT_LEN` | 1088 bytes | ML-KEM-768 Ciphertext (encapsulation).     |
+| `AES_KEY_LEN`   | 32 bytes   | 256-bit symmetric key.                     |
+| `IV_LENGTH`     | 12 bytes   | Standard GCM Initialization Vector length. |
 
 
 ### 4. Encryption Logic Flows
