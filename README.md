@@ -2,7 +2,7 @@
 
 [![Developed by Zelijah](https://img.shields.io/badge/Developed%20by-Zelijah-red?logo=github&logoColor=white)](https://thezelijah.world) ![GitHub Sponsors](https://img.shields.io/github/sponsors/jedlsf?style=plastic&label=Sponsors&link=https%3A%2F%2Fgithub.com%2Fsponsors%2Fjedlsf)
 
-**Majik File** is the core cryptographic engine for secure file handling in the [Majik Message](https://github.com/Majikah/majik-message) ecosystem. It provides a **post-quantum secure "envelope" format** designed for file encryption, multi-recipient key encapsulation, and transparent compression using NIST-standardized algorithms.
+**Majik File** is the core cryptographic engine for secure file handling in the [Majik Message](https://github.com/Majikah/majik-message) ecosystem. It provides a **post-quantum secure "MJKB" format** designed for file encryption, multi-recipient key encapsulation, and transparent compression using NIST-standardized algorithms.
 
 ![npm](https://img.shields.io/npm/v/@majikah/majik-file) ![npm downloads](https://img.shields.io/npm/dm/@majikah/majik-file) ![npm bundle size](https://img.shields.io/bundlephobia/min/%40majikah%2Fmajik-file) [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) ![TypeScript](https://img.shields.io/badge/TypeScript-Ready-blue)
 
@@ -13,18 +13,15 @@
     - [Key Features](#key-features)
   - [Installation](#installation)
   - [Usage Guide](#usage-guide)
-    - [Encrypting a Message (Single Recipient)](#encrypting-a-message-single-recipient)
-    - [Encrypting for a Group (2+ Recipients)](#encrypting-for-a-group-2-recipients)
-    - [Decrypting an Envelope](#decrypting-an-envelope)
-  - [Technical Specifications Reference](#technical-specifications-reference)
-    - [1. Cryptographic Stack (Envelope)](#1-cryptographic-stack-envelope)
-    - [2. Binary Structure \& Framing](#2-binary-structure--framing)
-      - [Internal Binary Layout (Decoded Base64):](#internal-binary-layout-decoded-base64)
-    - [3. Primitive Parameters](#3-primitive-parameters)
-    - [4. Encryption Logic Flows](#4-encryption-logic-flows)
-      - [A. Single-Recipient (Direct)](#a-single-recipient-direct)
-      - [B. Multi-Recipient (Group)](#b-multi-recipient-group)
-    - [5. Implementation Notes](#5-implementation-notes)
+    - [Creating a MajikFile](#creating-a-majikfile)
+    - [Accessing metadata](#accessing-metadata)
+    - [Encrypting and exporting](#encrypting-and-exporting)
+    - [Decrypting a MajikFile](#decrypting-a-majikfile)
+    - [Sharing](#sharing)
+    - [Duplicate Detection](#duplicate-detection)
+    - [Stats](#stats)
+    - [Static Helpers](#static-helpers)
+  - [Notes](#notes)
   - [Related Projects](#related-projects)
     - [Majik Message](#majik-message)
     - [Majik Key](#majik-key)
@@ -55,11 +52,20 @@ This allows developers to **securely encrypt and share files with minimal crypto
 
 ### Key Features
 
-- **Post-Quantum Security** – Exclusively uses ML-KEM-768 for key encapsulation.  
-- **Hybrid Encryption** – Combines ML-KEM shared secrets with AES-256-GCM for high-speed file encryption.  
-- **Group File Sharing** – Encrypt a file for multiple recipients with a single ciphertext and multiple key wraps.  
-- **Transparent Compression** – Built-in Zstd and Gzip support via `MajikCompressor` to reduce file size.  
-- **Strict Format** – Binary-backed envelopes with a standardized Base64 string representation (`~*$MJKFILE:`).  
+- **Single-recipient encryption**: ML-KEM encapsulation → AES-256-GCM key → encrypted `.mjkb`.
+- **Group encryption (2+ recipients)**:
+  - Random AES-256 key encrypts file once
+  - Per recipient: ML-KEM encapsulate → AES key XOR sharedSecret
+- **Write-once immutability**: `.mjkb` binaries are never patched in-place.
+- **Automatic deduplication**: Files are checked by SHA-256 hash before encryption.
+- **Context-aware storage**:
+  - `user_upload`, `chat_attachment`, `chat_image`, `thread_attachment`
+- **Optional image conversion**: Chat images/attachments converted to WebP for efficiency.
+- **Compression**: Zstd at level 22 for compressible formats.
+- **Expiry and sharing**:
+  - Temporary files with expiry date
+  - Shareable links with auto-generated tokens
+- **Inline viewable MIME detection** and safe download filename derivation.
 
 ---
 
@@ -74,146 +80,158 @@ npm install @majikah/majik-file
 
 ## Usage Guide
 
-### Encrypting a Message (Single Recipient)
+### Creating a MajikFile
 
 The library automatically chooses between "Single" and "Group" logic based on the number of recipients.
 
 ```ts
-import { MajikFileEnvelope } from "@majikah/majik-file";
-import fs from "fs";
+import { MajikFile } from "@majikah/majik-file";
 
-const fileBuffer = fs.readFileSync("secret.pdf");
-
-const envelope = await MajikFileEnvelope.encrypt({
-  data: fileBuffer,
-  recipients: [{
-    fingerprint: "recipient_fingerprint_base64",
-    mlKemPublicKey: recipientPublicKeyBytes // Uint8Array (1184 bytes)
-  }],
-  compress: true // Default is true
+const file = await MajikFile.create({
+  data: myFileBlob,           // Blob, ArrayBuffer, or Uint8Array
+  identity: {
+    userId: "user_123",
+    fingerprint: "BASE64_FINGERPRINT",
+    mlKemPublicKey: publicKey // Uint8Array of length 1184 bytes
+  },
+  context: "user_upload",     // or "chat_attachment", "chat_image", "thread_attachment"
+  originalName: "photo.png",
+  recipients: [               // Optional: for group encryption
+    {
+      fingerprint: "recipient_fingerprint",
+      mlKemPublicKey: recipientPublicKey
+    }
+  ],
+  isTemporary: true,          // Optional
+  expiresAt: MajikFile.buildExpiryDate(15)
 });
-
-// Convert to scanner-ready string
-const secretString = envelope.toString(); 
-// Output: ~*$MJKFILE:AbC123...
 
 
 ```
 
-### Encrypting for a Group (2+ Recipients)
+### Accessing metadata
 
 For group messages, a senderFingerprint is required for metadata.
 
 ```ts
-import { MajikEnvelope } from "@majikah/majik-file";
-
-const groupEnvelope = await MajikEnvelope.encrypt({
-  plaintext: "Secret group meeting at midnight.",
-  senderFingerprint: "my_fingerprint_base64",
-  recipients: [
-    { fingerprint: "alice_fp", mlKemPublicKey: alicePk },
-    { fingerprint: "bob_fp", mlKemPublicKey: bobPk }
-  ]
-});
-
-// Convert to the scanner-ready string
-const secretString = groupEnvelope.toString(); 
-// Output: ~*$MJKMSG:AbC123...
+console.log(file.id);
+console.log(file.originalName);
+console.log(file.sizeMB);
+console.log(file.isGroup);
+console.log(file.isExpired);
+console.log(file.safeFilename);
 
 
 ```
 
 
-### Decrypting an Envelope
+### Encrypting and exporting
+
+
+```ts
+// Export .mjkb binary for R2 upload
+const mjkbBlob = file.toMJKB();
+
+// Export raw Uint8Array
+const rawBytes = file.toBinaryBytes();
+
+
+
+```
+
+### Decrypting a MajikFile
 
 To decrypt, you simply provide the recipient's identity (their private ML-KEM key and fingerprint).
 
 ```ts
-import { MajikEnvelope } from "@majikah/majik-file";
+import { MajikFile } from "@majikah/majik-file";
 
-const identity = {
-  fingerprint: "my_fingerprint_base64",
-  mlKemSecretKey: mySecretKeyBytes // Uint8Array (2400 bytes)
-};
+const decrypted = await MajikFile.decrypt(
+  mjkbBlob,
+  {
+    fingerprint: "BASE64_FINGERPRINT",
+    mlKemSecretKey: secretKey // Uint8Array of length 2400 bytes
+  }
+);
 
-try {
-  // Option 1: Decrypt from an existing instance
-  const decrypted = await envelope.decrypt(identity);
-  
-  // Option 2: Parse from a string first
-  const parsedEnvelope = MajikEnvelope.fromString("~*$MJKMSG:...");
-  const text = await parsedEnvelope.decrypt(identity);
-  
-  console.log(text); // "Hello, this is a quantum-safe secret."
-} catch (error) {
-  console.error("Decryption failed: Unauthorized or tampered message.");
-}
+// If you already loaded the binary into memory
+await file.decryptBinary({
+  fingerprint: "BASE64_FINGERPRINT",
+  mlKemSecretKey: secretKey
+});
 
 ```
 
+### Sharing
+
+Enable sharing (auto-generates token if not provided)
+
+```ts
+
+const token = file.toggleSharing();
+
+// Disable sharing
+file.toggleSharing();
+
+```
+
+### Duplicate Detection
+
+```ts
+
+if (file.isDuplicateOf(otherFile)) {
+  console.log("Duplicate file detected");
+}
+
+if (MajikFile.wouldBeDuplicate(newRawBytes, existingHash)) {
+  console.log("New data is a duplicate");
+}
+
+
+```
+
+### Stats
+
+```ts
+
+console.log(file.getStats());
+
+
+```
+
+
+### Static Helpers
+
+```ts
+import { MajikFile } from "@majikah/majik-file";
+
+MajikFile.buildExpiryDate(15);   // ISO expiry date string
+MajikFile.formatBytes(1024);     // "1 KB"
+MajikFile.inferMimeType("file.png"); // "image/png"
+MajikFile.isMjkbCandidate(someBytes); // true/false
+MajikFile.hasPublicKeyAccess(pubKey, ownerFingerprint); // true/false
+
+```
+
+
 ---
+## Notes
 
-## Technical Specifications Reference
+.mjkb format:
 
-### 1. Cryptographic Stack (Envelope)
-Majik File is designed to be **Post-Quantum Secure (PQS)** by default, moving away from classical ECC for key encapsulation.
+```
+[4   magic "MJKB"]
+[1   version]
+[12  AES-GCM IV]
+[4   payload JSON length (big-endian uint32)]
+[N   payload JSON — MjkbSinglePayload | MjkbGroupPayload]
+[M   AES-GCM ciphertext (Zstd-compressed file + 16-byte auth tag)]
 
-| Component                    | Primitive   | Implementation / Standard       |
-| :--------------------------- | :---------- | :------------------------------ |
-| **Key Encapsulation (KEM)**  | ML-KEM-768  | FIPS-203 (formerly Kyber)       |
-| **Symmetric Encryption**     | AES-256-GCM | NIST SP 800-38D                 |
-| **Hashing / Fingerprinting** | SHA-256     | FIPS 180-4                      |
-| **Key Derivation (KDF)**     | Argon2id    | OWASP Recommended (v2 accounts) |
-| **Compression**              | Zstd / Gzip | `@bokuweb/zstd-wasm` / `fflate` |
+```
 
-
-### 2. Binary Structure & Framing
-The library produces a "Scanner-Ready" string. This is a Base64-encoded binary blob prefixed with a protocol identifier.
-
-**Format:** `~*$MJKMSG:<Base64_Payload>`
-
-#### Internal Binary Layout (Decoded Base64):
-| Offset (Bytes) | Length   | Field           | Description                                          |
-| :------------- | :------- | :-------------- | :--------------------------------------------------- |
-| `0`            | 1        | **Version**     | Set to `0x03` for current PQ format.                 |
-| `1`            | 32       | **Fingerprint** | SHA-256 of the recipient (Single) or Sender (Group). |
-| `33`           | Variable | **Payload**     | UTF-8 JSON string containing IVs and ciphertexts.    |
-
-
-### 3. Primitive Parameters
-| Parameter       | Value      | Description                                |
-| :-------------- | :--------- | :----------------------------------------- |
-| `ML_KEM_PK_LEN` | 1184 bytes | ML-KEM-768 Public Key size.                |
-| `ML_KEM_SK_LEN` | 2400 bytes | ML-KEM-768 Secret Key size.                |
-| `ML_KEM_CT_LEN` | 1088 bytes | ML-KEM-768 Ciphertext (encapsulation).     |
-| `AES_KEY_LEN`   | 32 bytes   | 256-bit symmetric key.                     |
-| `IV_LENGTH`     | 12 bytes   | Standard GCM Initialization Vector length. |
-
-
-### 4. Encryption Logic Flows
-
-#### A. Single-Recipient (Direct)
-1. **Compress**: Plaintext is compressed using Zstd (or Gzip fallback).
-2. **Encapsulate**: Generate a `sharedSecret` (32b) and `mlKemCipherText` (1088b) using the recipient's Public Key.
-3. **Encrypt**: Encrypt the compressed data via AES-256-GCM using the `sharedSecret` as the key.
-4. **Pack**: Encode the `iv`, `ciphertext`, and `mlKemCipherText` into a `SinglePayload` JSON object.
-
-#### B. Multi-Recipient (Group)
-1. **Compress**: Plaintext is compressed.
-2. **Key Generation**: Generate a random 32-byte `masterAesKey`.
-3. **Encrypt**: Encrypt the compressed data via AES-256-GCM using the `masterAesKey`.
-4. **Wrap Keys**: For **each** recipient:
-   - Perform ML-KEM encapsulation to get a unique `sharedSecret`.
-   - `encryptedAesKey = masterAesKey XOR sharedSecret`.
-   - Store the recipient's `fingerprint`, `mlKemCipherText`, and `encryptedAesKey`.
-5. **Pack**: Encode the `iv`, `ciphertext`, and the array of `keys` into a `GroupPayload` JSON object.
-
-
-### 5. Implementation Notes
-- **Authentication**: AES-GCM provides AEAD (Authenticated Encryption with Associated Data). If a message is tampered with or the wrong key is used, decryption will throw an "Auth tag mismatch" error.
-- **Quantum Resistance**: Because the symmetric key is derived via ML-KEM-768, the message remains secure even against future Shor's algorithm-based attacks that would break RSA or Elliptic Curve (X25519) systems.
-- **Graceful Degradation**: The `MajikCompressor` automatically handles decompression by identifying the `mjkcmp` magic header, ensuring compatibility even if compression settings change.
-
+- Owner is always first recipient in group encryption.
+- Files cannot be updated in place — delete + re-create for modifications.
+- Chat images always use conversation-scoped R2 prefix.
 
 ---
 
