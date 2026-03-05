@@ -692,8 +692,8 @@ export class MajikFile {
       // Written at encryption time as short keys n/m to keep the binary compact.
       // Older .mjkb files without these fields return null — callers should fall
       // back to stripping ".mjkb" from the filename and using "application/octet-stream".
-      const originalName = (payload).n ?? null;
-      const mimeType = (payload).m ?? null;
+      const originalName = payload.n;
+      const mimeType = payload.m;
 
       return { bytes, originalName, mimeType };
     } catch (err) {
