@@ -8,7 +8,58 @@
 
 ---
 
-# 1. Overview
+- [MJKB — Majik Binary Container Format](#mjkb--majik-binary-container-format)
+  - [1. Overview](#1-overview)
+  - [2. Design Goals](#2-design-goals)
+          - [Security](#security)
+          - [Portability](#portability)
+          - [Efficiency](#efficiency)
+          - [Simplicity](#simplicity)
+  - [3. High-Level Architecture](#3-high-level-architecture)
+  - [4. Cryptographic Model](#4-cryptographic-model)
+      - [4.1 Key Encapsulation](#41-key-encapsulation)
+      - [4.2 Symmetric Encryption](#42-symmetric-encryption)
+      - [4.3 Randomness](#43-randomness)
+  - [5. Binary Layout](#5-binary-layout)
+      - [Container Layout](#container-layout)
+  - [6. Field Definitions](#6-field-definitions)
+      - [6.1 Magic Bytes](#61-magic-bytes)
+      - [6.2 Format Version](#62-format-version)
+      - [6.3 Flags](#63-flags)
+      - [6.4 KEM Ciphertext Length](#64-kem-ciphertext-length)
+      - [6.5 Metadata Length](#65-metadata-length)
+      - [6.6 IV Length](#66-iv-length)
+      - [6.7 Initialization Vector](#67-initialization-vector)
+      - [6.8 KEM Ciphertext](#68-kem-ciphertext)
+      - [6.9 Metadata Section](#69-metadata-section)
+      - [6.10 Encrypted Payload](#610-encrypted-payload)
+      - [6.11 Authentication Tag](#611-authentication-tag)
+  - [7. Compression (Optional)](#7-compression-optional)
+  - [8. Parsing Algorithm](#8-parsing-algorithm)
+          - [1. verify magic bytes](#1-verify-magic-bytes)
+          - [2. verify format version](#2-verify-format-version)
+          - [3. read flags](#3-read-flags)
+          - [4. read section lengths](#4-read-section-lengths)
+          - [5. read IV](#5-read-iv)
+          - [6. read KEM ciphertext](#6-read-kem-ciphertext)
+          - [7. read metadata](#7-read-metadata)
+          - [8. read encrypted payload](#8-read-encrypted-payload)
+          - [9. read authentication tag](#9-read-authentication-tag)
+          - [10. decapsulate symmetric key](#10-decapsulate-symmetric-key)
+          - [11. decrypt payload](#11-decrypt-payload)
+          - [12. verify authentication tag](#12-verify-authentication-tag)
+  - [9. Security Considerations](#9-security-considerations)
+  - [10. MIME Type](#10-mime-type)
+  - [11. File Identification](#11-file-identification)
+  - [13. Reference Implementation](#13-reference-implementation)
+  - [14. Versioning](#14-versioning)
+  - [Author](#author)
+  - [About the Developer](#about-the-developer)
+  - [Contact](#contact)
+
+---
+
+## 1. Overview
 
 **MJKB (Majik Binary Container)** is a secure binary container format designed for **confidential file transport, storage, and messaging**. The format provides:
 
@@ -25,33 +76,33 @@ The format is implemented in the **MajikFile library** and used within the **Maj
 
 ---
 
-# 2. Design Goals
+## 2. Design Goals
 
 MJKB was designed with the following goals:
 
-### Security
+###### Security
 - Post-quantum key exchange using ML-KEM
 - Authenticated encryption via AES-GCM
 - Tamper detection
 
-### Portability
+###### Portability
 - Platform-independent binary format
 - Deterministic parsing
 - Language-agnostic implementation
 
-### Efficiency
+###### Efficiency
 - Binary encoding
 - Optional compression
 - Streaming-friendly layout
 
-### Simplicity
+###### Simplicity
 - Minimal header
 - Explicit length encoding
 - No nested container complexity
 
 ---
 
-# 3. High-Level Architecture
+## 3. High-Level Architecture
 
 An MJKB container contains the following logical components:
 
@@ -73,11 +124,11 @@ The encrypted payload may contain:
 
 ---
 
-# 4. Cryptographic Model
+## 4. Cryptographic Model
 
 MJKB uses a **hybrid encryption architecture**.
 
-## 4.1 Key Encapsulation
+#### 4.1 Key Encapsulation
 
 A symmetric encryption key is derived using a **post-quantum Key Encapsulation Mechanism (KEM)**.
 
@@ -103,7 +154,7 @@ decapsulation → recover AES key → decrypt payload
 
 ---
 
-## 4.2 Symmetric Encryption
+#### 4.2 Symmetric Encryption
 
 Payload encryption uses: **AES-256-GCM**
 
@@ -115,7 +166,7 @@ Properties:
 
 ---
 
-## 4.3 Randomness
+#### 4.3 Randomness
 
 All cryptographic randomness must come from a **cryptographically secure random number generator (CSPRNG)**.
 
@@ -128,11 +179,11 @@ Examples:
 
 ---
 
-# 5. Binary Layout
+## 5. Binary Layout
 
 All integers are **big-endian** unless otherwise stated.
 
-## Container Layout
+#### Container Layout
 
 
 | Magic Bytes (4)           |
@@ -151,9 +202,9 @@ All integers are **big-endian** unless otherwise stated.
 
 ---
 
-# 6. Field Definitions
+## 6. Field Definitions
 
-## 6.1 Magic Bytes
+#### 6.1 Magic Bytes
 
 Length: 4 bytes
 Value: ASCII "MJKB"
@@ -166,7 +217,7 @@ Purpose:
 - File validation
 
 
-## 6.2 Format Version
+#### 6.2 Format Version
 
 Length: 1 byte
 Current version: 0x01
@@ -175,7 +226,7 @@ Current version: 0x01
 Future versions must remain backward compatible where possible.
 
 
-## 6.3 Flags
+#### 6.3 Flags
 Length: 1 byte
 
 Bit flags indicating optional features.
@@ -191,7 +242,7 @@ Example allocation:
 Unused bits MUST be zero.
 
 
-## 6.4 KEM Ciphertext Length
+#### 6.4 KEM Ciphertext Length
 Specifies length of the encapsulated ML-KEM ciphertext.
 
 Typical values:
@@ -201,7 +252,7 @@ ML-KEM-512 : 768 bytes
 ML-KEM-768 : 1088 bytes
 ML-KEM-1024 : 1568 bytes
 
-## 6.5 Metadata Length
+#### 6.5 Metadata Length
 Length: 4 bytes
 
 
@@ -213,7 +264,7 @@ If absent:
 value = 0
 
 
-## 6.6 IV Length
+#### 6.6 IV Length
 
 
 Length: 1 byte
@@ -226,7 +277,7 @@ For AES-GCM the IV length is typically:
 
 
 
-## 6.7 Initialization Vector
+#### 6.7 Initialization Vector
 
 
 Length: variable
@@ -237,7 +288,7 @@ Random IV used for AES-GCM encryption.
 Must never repeat with the same key.
 
 
-## 6.8 KEM Ciphertext
+#### 6.8 KEM Ciphertext
 
 Contains the encapsulated symmetric key.
 
@@ -251,7 +302,7 @@ Stored exactly as returned by the KEM implementation.
 
 ---
 
-## 6.9 Metadata Section
+#### 6.9 Metadata Section
 
 Optional metadata.
 
@@ -273,7 +324,7 @@ Example:
 ```
 Metadata SHOULD remain small.
 
-## 6.10 Encrypted Payload
+#### 6.10 Encrypted Payload
 
 The payload is encrypted using:
 
@@ -289,7 +340,7 @@ ciphertext
 
 The authentication tag is stored separately.
 
-## 6.11 Authentication Tag
+#### 6.11 Authentication Tag
 Length: 16 bytes
 
 Produced by AES-GCM.
@@ -302,7 +353,7 @@ container MUST be rejected
 
 ---
 
-# 7. Compression (Optional)
+## 7. Compression (Optional)
 
 If compression flag is set:
 
@@ -322,22 +373,22 @@ smaller encrypted payload
 
 ---
 
-# 8. Parsing Algorithm
+## 8. Parsing Algorithm
 
 Recommended decoding procedure:
 
-### 1. verify magic bytes
-### 2. verify format version
-### 3. read flags
-### 4. read section lengths
-### 5. read IV
-### 6. read KEM ciphertext
-### 7. read metadata
-### 8. read encrypted payload
-### 9. read authentication tag
-### 10. decapsulate symmetric key
-### 11. decrypt payload
-### 12. verify authentication tag
+###### 1. verify magic bytes
+###### 2. verify format version
+###### 3. read flags
+###### 4. read section lengths
+###### 5. read IV
+###### 6. read KEM ciphertext
+###### 7. read metadata
+###### 8. read encrypted payload
+###### 9. read authentication tag
+###### 10. decapsulate symmetric key
+###### 11. decrypt payload
+###### 12. verify authentication tag
 
 If any validation fails:
 
@@ -345,7 +396,7 @@ parsing **MUST** terminate
 
 ---
 
-# 9. Security Considerations
+## 9. Security Considerations
 
 Implementations must enforce:
 
@@ -359,7 +410,7 @@ Implementations must enforce:
 
 - Randomness: All cryptographic randomness must be CSPRNG derived.
 
-# 10. MIME Type
+## 10. MIME Type
 
 Proposed MIME type:
 
@@ -373,7 +424,7 @@ Example HTTP usage:
 
 Content-Type: application/vnd.majikah.bundle
 
-# 11. File Identification
+## 11. File Identification
 
 Magic number: 4D 4A 4B 42
 
@@ -396,7 +447,7 @@ Offset: 0x00
 | Encrypted Payload         |
 | Authentication Tag (16)   |
 
-# 13. Reference Implementation
+## 13. Reference Implementation
 
 Reference implementations are provided in:
 
@@ -413,7 +464,7 @@ Core cryptographic operations include:
 - AES-GCM encryption
 - secure random generation
 
-# 14. Versioning
+## 14. Versioning
 
 Future versions of MJKB may introduce:
 
