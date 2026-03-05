@@ -515,7 +515,6 @@ export class MajikFile {
       throw MajikFileError.encryptionFailed(err);
     }
   }
-
   // ── DECRYPT (static) ──────────────────────────────────────────────────────
 
   /**
@@ -598,6 +597,97 @@ export class MajikFile {
       }
 
       return await MajikCompressor.decompress(compressed);
+    } catch (err) {
+      if (err instanceof MajikFileError) throw err;
+      throw MajikFileError.decryptionFailed("File decryption failed", err);
+    }
+  }
+
+  /**
+   * Decrypt a .mjkb binary and return the raw bytes together with the
+   * original filename and MIME type that were embedded in the payload at
+   * encryption time.
+   *
+   * This is the preferred method for the File Vault UI because it avoids a
+   * second parse of the binary — everything comes from the single decodeMjkb
+   * call that decryption already performs.
+   *
+   * @returns `{ bytes, originalName, mimeType }` where `originalName` and
+   *          `mimeType` may be null if the file was encrypted without metadata.
+   */
+  static async decryptWithMetadata(
+    source: Blob | Uint8Array | ArrayBuffer,
+    identity: Pick<MajikFileIdentity, "fingerprint" | "mlKemSecretKey">,
+  ): Promise<{
+    bytes: Uint8Array;
+    originalName: string | null;
+    mimeType: string | null;
+  }> {
+    if (!identity)
+      throw MajikFileError.invalidInput("identity is required for decryption");
+    if (
+      !(identity.mlKemSecretKey instanceof Uint8Array) ||
+      identity.mlKemSecretKey.length !== ML_KEM_SK_LEN
+    ) {
+      throw MajikFileError.invalidInput(
+        `identity.mlKemSecretKey must be ${ML_KEM_SK_LEN} bytes (got ${
+          (identity.mlKemSecretKey as any)?.length ?? "undefined"
+        })`,
+      );
+    }
+
+    try {
+      const raw = await normaliseToUint8ArrayAsync(source);
+      const { iv, payload, ciphertext } = decodeMjkb(raw);
+
+      let aesKey: Uint8Array;
+
+      if (isMjkbSinglePayload(payload)) {
+        const mlKemCT = base64ToUint8Array(payload.mlKemCipherText);
+        aesKey = mlKemDecapsulate(mlKemCT, identity.mlKemSecretKey);
+      } else if (isMjkbGroupPayload(payload)) {
+        if (!identity.fingerprint?.trim()) {
+          throw MajikFileError.invalidInput(
+            "identity.fingerprint is required to decrypt group files",
+          );
+        }
+        const entry = payload.keys.find(
+          (k) => k.fingerprint === identity.fingerprint,
+        );
+        if (!entry) {
+          throw MajikFileError.decryptionFailed(
+            `No key entry found for fingerprint "${identity.fingerprint}"`,
+          );
+        }
+        const mlKemCT = base64ToUint8Array(entry.mlKemCipherText);
+        const sharedSecret = mlKemDecapsulate(mlKemCT, identity.mlKemSecretKey);
+        const encAesKey = base64ToUint8Array(entry.encryptedAesKey);
+        aesKey = new Uint8Array(AES_KEY_LEN);
+        for (let i = 0; i < AES_KEY_LEN; i++) {
+          aesKey[i] = encAesKey[i] ^ sharedSecret[i];
+        }
+      } else {
+        throw MajikFileError.formatError(
+          ".mjkb payload JSON is neither a single nor group payload",
+        );
+      }
+
+      const compressed = aesGcmDecrypt(aesKey, iv, ciphertext);
+      if (!compressed) {
+        throw MajikFileError.decryptionFailed(
+          "Decryption failed — wrong key or corrupted .mjkb file",
+        );
+      }
+
+      const bytes = await MajikCompressor.decompress(compressed);
+
+      // Extract original_name and mime_type from the payload.
+      // Both fields are written at encryption time by MajikFile.create().
+      // They may be null for files encrypted without metadata.
+      const originalName = (payload as any).original_name ?? null;
+      const mimeType = (payload as any).mime_type ?? null;
+
+      return { bytes, originalName, mimeType };
     } catch (err) {
       if (err instanceof MajikFileError) throw err;
       throw MajikFileError.decryptionFailed("File decryption failed", err);

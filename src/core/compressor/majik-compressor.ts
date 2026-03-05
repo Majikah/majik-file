@@ -17,24 +17,22 @@ import {
 import { MajikFileError } from "../error";
 import { ZSTD_MAX_LEVEL } from "../crypto/constants";
 
-// ─── Init Guard ───────────────────────────────────────────────────────────────
-
-let zstdReady = false;
-
-/**
- * Ensure the Zstd WASM module is initialised.
- * Safe to call concurrently — the second caller will await the same promise.
- */
-export async function ensureZstd(): Promise<void> {
-  if (!zstdReady) {
-    await init();
-    zstdReady = true;
-  }
-}
-
 // ─── MajikCompressor ──────────────────────────────────────────────────────────
 
 export class MajikCompressor {
+  private static initialized = false;
+
+  /**
+   * Ensure the Zstd WASM module is initialised.
+   * Safe to call concurrently — the second caller will await the same promise.
+   */
+  private static async ensureInit() {
+    if (!this.initialized) {
+      await init(); // only init Zstd for binary mode
+      this.initialized = true;
+    }
+  }
+
   /**
    * Compress raw bytes using Zstd at the specified level.
    *
@@ -58,7 +56,7 @@ export class MajikCompressor {
       );
     }
     try {
-      await ensureZstd();
+      await this.ensureInit();
       return zstdCompress(data, level);
     } catch (err) {
       throw MajikFileError.compressionFailed(err);
@@ -79,7 +77,7 @@ export class MajikCompressor {
       );
     }
     try {
-      await ensureZstd();
+      await this.ensureInit();
       return zstdDecompress(data);
     } catch (err) {
       throw MajikFileError.decompressionFailed(err);
