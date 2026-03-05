@@ -433,6 +433,8 @@ export class MajikFile {
 
         payload = {
           mlKemCipherText: arrayToBase64(mlKemCT),
+          n: originalName ?? null,
+          m: resolvedMimeType ?? null,
         } satisfies MjkbSinglePayload;
       } else {
         // ── Group ─────────────────────────────────────────────────────────
@@ -465,7 +467,11 @@ export class MajikFile {
           };
         });
 
-        payload = { keys } satisfies MjkbGroupPayload;
+        payload = {
+          keys,
+          n: originalName ?? null,
+          m: resolvedMimeType ?? null,
+        } satisfies MjkbGroupPayload;
       }
 
       // ── 6. Encode .mjkb ───────────────────────────────────────────────
@@ -515,6 +521,7 @@ export class MajikFile {
       throw MajikFileError.encryptionFailed(err);
     }
   }
+
   // ── DECRYPT (static) ──────────────────────────────────────────────────────
 
   /**
@@ -681,11 +688,12 @@ export class MajikFile {
 
       const bytes = await MajikCompressor.decompress(compressed);
 
-      // Extract original_name and mime_type from the payload.
-      // Both fields are written at encryption time by MajikFile.create().
-      // They may be null for files encrypted without metadata.
-      const originalName = (payload as any).original_name ?? null;
-      const mimeType = (payload as any).mime_type ?? null;
+      // Extract original filename and MIME type from the payload.
+      // Written at encryption time as short keys n/m to keep the binary compact.
+      // Older .mjkb files without these fields return null — callers should fall
+      // back to stripping ".mjkb" from the filename and using "application/octet-stream".
+      const originalName = (payload).n ?? null;
+      const mimeType = (payload).m ?? null;
 
       return { bytes, originalName, mimeType };
     } catch (err) {

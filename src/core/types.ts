@@ -66,6 +66,10 @@ export interface MajikFileGroupKey {
 export interface MjkbSinglePayload {
   /** Base64-encoded ML-KEM-768 ciphertext (1088 bytes). */
   mlKemCipherText: string;
+  /** Original filename (e.g. "photo.png"). Short key keeps the binary compact. */
+  n?: string | null;
+  /** Original MIME type (e.g. "image/png"). Short key keeps the binary compact. */
+  m?: string | null;
 }
 
 /**
@@ -76,6 +80,10 @@ export interface MjkbSinglePayload {
 export interface MjkbGroupPayload {
   /** Per-recipient key entries. */
   keys: MajikFileGroupKey[];
+  /** Original filename (e.g. "photo.png"). Short key keeps the binary compact. */
+  n?: string | null;
+  /** Original MIME type (e.g. "image/png"). Short key keeps the binary compact. */
+  m?: string | null;
 }
 
 export type MjkbPayload = MjkbSinglePayload | MjkbGroupPayload;
