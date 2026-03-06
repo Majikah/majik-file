@@ -291,7 +291,7 @@ export class MajikFile {
       chatMessageId = null,
       threadMessageId = null,
       conversationId = null,
-      userId
+      userId,
     } = options;
 
     // ── Input validation ─────────────────────────────────────────────────
@@ -399,7 +399,10 @@ export class MajikFile {
       // WebP and therefore skipped here — WebP is already codec-compressed.
       // For user_upload and thread_attachment, compressible images (PNG, BMP,
       // TIFF, SVG, etc.) are Zstd-compressed at level 22.
-      const compressible = shouldCompress(resolvedMimeType);
+      const compressible =
+        context === "user_upload" || context === "thread_attachment"
+          ? true
+          : shouldCompress(resolvedMimeType);
       const compressed = compressible
         ? await MajikCompressor.compress(processedBytes)
         : processedBytes;
@@ -436,6 +439,7 @@ export class MajikFile {
           mlKemCipherText: arrayToBase64(mlKemCT),
           n: originalName ?? null,
           m: resolvedMimeType ?? null,
+          c: context ?? null,
         } satisfies MjkbSinglePayload;
       } else {
         // ── Group ─────────────────────────────────────────────────────────
@@ -472,6 +476,7 @@ export class MajikFile {
           keys,
           n: originalName ?? null,
           m: resolvedMimeType ?? null,
+          c: context ?? null,
         } satisfies MjkbGroupPayload;
       }
 
@@ -597,14 +602,22 @@ export class MajikFile {
         );
       }
 
-      const compressed = aesGcmDecrypt(aesKey, iv, ciphertext);
-      if (!compressed) {
+      const decrypted = aesGcmDecrypt(aesKey, iv, ciphertext);
+      if (!decrypted) {
         throw MajikFileError.decryptionFailed(
           "Decryption failed — wrong key or corrupted .mjkb file",
         );
       }
 
-      return await MajikCompressor.decompress(compressed);
+      const compressible =
+        payload.c === "user_upload" || payload.c === "thread_attachment"
+          ? true
+          : shouldCompress(payload.m);
+      const returnData = compressible
+        ? await MajikCompressor.decompress(decrypted)
+        : decrypted;
+
+      return returnData;
     } catch (err) {
       if (err instanceof MajikFileError) throw err;
       throw MajikFileError.decryptionFailed("File decryption failed", err);
@@ -680,14 +693,20 @@ export class MajikFile {
         );
       }
 
-      const compressed = aesGcmDecrypt(aesKey, iv, ciphertext);
-      if (!compressed) {
+      const decrypted = aesGcmDecrypt(aesKey, iv, ciphertext);
+      if (!decrypted) {
         throw MajikFileError.decryptionFailed(
           "Decryption failed — wrong key or corrupted .mjkb file",
         );
       }
 
-      const bytes = await MajikCompressor.decompress(compressed);
+      const compressible =
+        payload.c === "user_upload" || payload.c === "thread_attachment"
+          ? true
+          : shouldCompress(payload.m);
+      const bytes = compressible
+        ? await MajikCompressor.decompress(decrypted)
+        : decrypted;
 
       // Extract original filename and MIME type from the payload.
       // Written at encryption time as short keys n/m to keep the binary compact.

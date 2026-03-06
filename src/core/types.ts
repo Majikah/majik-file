@@ -71,6 +71,8 @@ export interface MjkbSinglePayload {
   n: string | null;
   /** Original MIME type (e.g. "image/png"). Short key keeps the binary compact. */
   m: string | null;
+  /** Usage context — determines downstream UX and access control. */
+  c: FileContext | null;
 }
 
 /**
@@ -85,6 +87,8 @@ export interface MjkbGroupPayload {
   n: string | null;
   /** Original MIME type (e.g. "image/png"). Short key keeps the binary compact. */
   m: string | null;
+  /** Usage context — determines downstream UX and access control. */
+  c: FileContext | null;
 }
 
 export type MjkbPayload = MjkbSinglePayload | MjkbGroupPayload;
