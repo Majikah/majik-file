@@ -1,3 +1,5 @@
+export type MajikMessagePublicKey = string;
+
 // ─── Domain Types ─────────────────────────────────────────────────────────────
 
 export type FileContext =
@@ -15,8 +17,7 @@ export type StorageType = "permanent" | "temporary";
  * Carries both keys — public for encryption, secret for decryption.
  */
 export interface MajikFileIdentity {
-  /** UUID from auth.users — used for R2 key construction and ownership checks. */
-  userId: string;
+  publicKey: MajikMessagePublicKey;
   /** Base64 SHA-256 of the ML-KEM public key — used to look up key entries. */
   fingerprint: string;
   /** ML-KEM-768 public key (1184 bytes) — used during encryption. */
@@ -167,6 +168,8 @@ export interface MajikFileJSON {
 export interface CreateOptions {
   /** Raw binary content of the file to encrypt. */
   data: Uint8Array | ArrayBuffer;
+  /** UUID from auth.users — used for R2 key construction and ownership checks. */
+  userId: string;
   /**
    * Identity of the file owner.
    * For single-recipient files, this is the only recipient (self-encryption).

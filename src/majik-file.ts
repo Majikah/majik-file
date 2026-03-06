@@ -291,14 +291,15 @@ export class MajikFile {
       chatMessageId = null,
       threadMessageId = null,
       conversationId = null,
+      userId
     } = options;
 
     // ── Input validation ─────────────────────────────────────────────────
 
     if (!data) throw MajikFileError.invalidInput("data is required");
     if (!identity) throw MajikFileError.invalidInput("identity is required");
-    if (!identity.userId?.trim())
-      throw MajikFileError.invalidInput("identity.userId is required");
+    if (!userId?.trim())
+      throw MajikFileError.invalidInput("userId is required");
     if (!identity.fingerprint?.trim())
       throw MajikFileError.invalidInput("identity.fingerprint is required");
     if (
@@ -482,18 +483,18 @@ export class MajikFile {
       // batch-deletion when a conversation is removed (single R2 prefix scan).
       let r2Key: string;
       if (context === "chat_image") {
-        r2Key = buildChatImageR2Key(conversationId!, identity.userId, fileHash);
+        r2Key = buildChatImageR2Key(conversationId!, userId, fileHash);
       } else if (isTemporary) {
-        r2Key = buildTemporaryR2Key(identity.userId, fileHash);
+        r2Key = buildTemporaryR2Key(userId, fileHash);
       } else {
-        r2Key = buildPermanentR2Key(identity.userId, fileHash);
+        r2Key = buildPermanentR2Key(userId, fileHash);
       }
 
       const now = new Date().toISOString();
 
       const json: MajikFileJSON = {
         id,
-        user_id: identity.userId,
+        user_id: userId,
         r2_key: r2Key,
         original_name: originalName,
         mime_type: resolvedMimeType,
