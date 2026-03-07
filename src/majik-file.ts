@@ -50,6 +50,7 @@ import type {
   MajikFileStats,
   FileContext,
   StorageType,
+  TempFileDuration,
 } from "./core/types";
 import { isMjkbGroupPayload, isMjkbSinglePayload } from "./core/types";
 
@@ -107,21 +108,21 @@ export class MajikFile {
 
   private readonly _id: string;
   private readonly _userId: string;
-  private readonly _r2Key: string;
+  private _r2Key: string;
   private readonly _originalName: string | null;
   private readonly _mimeType: string | null;
   private readonly _sizeOriginal: number;
   private readonly _sizeStored: number;
   private readonly _fileHash: string;
   private readonly _encryptionIv: string; // hex, mirrors .mjkb IV for audit only
-  private readonly _storageType: StorageType;
+  private _storageType: StorageType;
   private _isShared: boolean;
   private _shareToken: string | null;
   private readonly _context: FileContext | null;
   private readonly _chatMessageId: string | null;
   private readonly _threadMessageId: string | null;
   private readonly _conversationId: string | null;
-  private readonly _expiresAt: string | null;
+  private _expiresAt: string | null;
   private readonly _timestamp: string | null;
   private _lastUpdate: string | null; // mutable — updated on mutations
   private readonly _isGroup: boolean; // derived from payload type at create/parse time
@@ -287,7 +288,7 @@ export class MajikFile {
       isShared = false,
       id = generateUUID(),
       bypassSizeLimit = false,
-      expiresAt = null,
+      expiresAt = 15,
       chatMessageId = null,
       threadMessageId = null,
       conversationId = null,
@@ -490,7 +491,7 @@ export class MajikFile {
       if (context === "chat_image") {
         r2Key = buildChatImageR2Key(conversationId!, userId, fileHash);
       } else if (isTemporary) {
-        r2Key = buildTemporaryR2Key(userId, fileHash);
+        r2Key = buildTemporaryR2Key(userId, fileHash, expiresAt); // default TTL at creation time
       } else {
         r2Key = buildPermanentR2Key(userId, fileHash);
       }
@@ -514,7 +515,7 @@ export class MajikFile {
         chat_message_id: chatMessageId,
         thread_message_id: threadMessageId,
         conversation_id: conversationId,
-        expires_at: expiresAt,
+        expires_at: buildExpiryDate(expiresAt),
         timestamp: now,
         last_update: now,
       };
@@ -733,6 +734,72 @@ export class MajikFile {
   ): Promise<Uint8Array> {
     if (!this._binary) throw MajikFileError.missingBinary();
     return MajikFile.decrypt(this._binary, identity);
+  }
+
+  // ── STORAGE TYPE MUTATION ─────────────────────────────────────────────────
+
+  /**
+   * Mutate the storage type in-place and rebuild the R2 key to match.
+   *
+   * This is intentionally a low-level escape hatch. Prefer the convenience
+   * wrappers `setPermanent()` and `setTemporary(days?)` which enforce the
+   * required invariants automatically.
+   *
+   * @throws MajikFileError when switching to temporary without an expiresAt,
+   *         or if the instance has no userId / fileHash yet.
+   */
+  setStorageType(
+    type: StorageType,
+    expiresAt: string | null,
+    duration: TempFileDuration = 15,
+  ): void {
+    if (!["permanent", "temporary"].includes(type)) {
+      throw MajikFileError.invalidInput(
+        `setStorageType: type must be "permanent" or "temporary" (got "${type}")`,
+      );
+    }
+    if (type === "temporary" && !expiresAt) {
+      throw MajikFileError.invalidInput(
+        "setStorageType: expiresAt is required when switching to temporary. " +
+          "Use setTemporary(days?) instead.",
+      );
+    }
+    if (this._context === "chat_image") {
+      throw MajikFileError.invalidInput(
+        "setStorageType: chat_image files are conversation-scoped and cannot change storage type.",
+      );
+    }
+
+    const newR2Key =
+      type === "temporary"
+        ? buildTemporaryR2Key(this._userId, this._fileHash, duration)
+        : buildPermanentR2Key(this._userId, this._fileHash);
+
+    this._storageType = type;
+    this._expiresAt = type === "temporary" ? expiresAt : null;
+    this._r2Key = newR2Key;
+    this._lastUpdate = new Date().toISOString();
+  }
+  /**
+   * Switch to permanent storage. Clears any expiry date and updates the R2 key.
+   */
+  setPermanent(): void {
+    this.setStorageType("permanent", null);
+  }
+
+  /**
+   * Switch to temporary storage with a typed TTL duration.
+   * The duration determines both the R2 prefix bucket and the expiry date.
+   *
+   * @param duration  Days until expiry. Must be one of: 1 | 2 | 3 | 5 | 7 | 15.
+   *                  Defaults to 15 to match the R2 lifecycle policy.
+   */
+  setTemporary(duration: TempFileDuration = 15): void {
+    this.setStorageType(
+      "temporary",
+      MajikFile.buildExpiryDate(duration),
+      duration,
+    );
   }
 
   // ── SERIALISATION ─────────────────────────────────────────────────────────
@@ -1131,7 +1198,7 @@ export class MajikFile {
    * Build a default ISO-8601 expiry date for temporary files.
    * @param days Days from now. Defaults to 15 (R2 lifecycle policy).
    */
-  static buildExpiryDate(days = 15): string {
+  static buildExpiryDate(days: TempFileDuration = 15): string {
     return buildExpiryDate(days);
   }
 

@@ -2,7 +2,7 @@
   "name": "@majikah/majik-file",
   "type": "module",
   "description": "Majik File is the core cryptographic engine for secure file handling in the Majikah ecosystem. It provides a post-quantum secure \"MJKB\" format designed for file encryption, multi-recipient key encapsulation, and transparent compression using NIST-standardized algorithms.",
-  "version": "0.0.9",
+  "version": "0.0.11",
   "license": "Apache-2.0",
   "author": "Zelijah",
   "main": "./dist/index.js",

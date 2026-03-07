@@ -10,6 +10,9 @@ export type FileContext =
 
 export type StorageType = "permanent" | "temporary";
 
+/** Allowed TTLs for temporary files in days. Maps 1:1 to R2 lifecycle prefixes. */
+export type TempFileDuration = 1 | 2 | 3 | 5 | 7 | 15;
+
 // ─── Identities & Recipients ──────────────────────────────────────────────────
 
 /**
@@ -217,9 +220,9 @@ export interface CreateOptions {
    */
   bypassSizeLimit?: boolean;
   /**
-   * ISO-8601 expiry datetime. Required when isTemporary = true.
+   * Temporary file duration in days. Required when isTemporary = true.
    */
-  expiresAt?: string;
+  expiresAt?: TempFileDuration;
   /** Associate this file with a chat message (mutually exclusive with threadMessageId). */
   chatMessageId?: string;
   /** Associate this file with a thread message (mutually exclusive with chatMessageId). */

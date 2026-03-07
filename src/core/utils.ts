@@ -24,7 +24,12 @@ import {
   INCOMPRESSIBLE_MIME_TYPES,
   WEBP_CONVERTIBLE_IMAGE_TYPES,
 } from "./crypto/constants";
-import type { DecodedMjkb, MajikFileRecipient, MjkbPayload } from "./types";
+import type {
+  DecodedMjkb,
+  MajikFileRecipient,
+  MjkbPayload,
+  TempFileDuration,
+} from "./types";
 
 // ─── Base64 ───────────────────────────────────────────────────────────────────
 
@@ -105,10 +110,14 @@ export function buildPermanentR2Key(userId: string, fileHash: string): string {
 /**
  * Build an R2 object key for a temporary / public file.
  * Objects under this prefix are auto-deleted by the bucket lifecycle policy.
- *   files/public/<userId>_<fileHash>.mjkb
+ *   files/public/15/<userId>_<fileHash>.mjkb
  */
-export function buildTemporaryR2Key(userId: string, fileHash: string): string {
-  return `${R2_PREFIX.TEMPORARY}/${userId}_${fileHash}.mjkb`;
+export function buildTemporaryR2Key(
+  userId: string,
+  fileHash: string,
+  duration: TempFileDuration = 15,
+): string {
+  return `${R2_PREFIX.TEMPORARY}/${duration}/${userId}_${fileHash}.mjkb`;
 }
 
 /**
@@ -346,7 +355,7 @@ export function isExpired(expiresAt: string | null): boolean {
  * Build a default expiry ISO string for temporary files.
  * @param days Days from now. Defaults to 15 (matching the R2 lifecycle policy).
  */
-export function buildExpiryDate(days = 15): string {
+export function buildExpiryDate(days: TempFileDuration = 15): string {
   const d = new Date();
   d.setDate(d.getDate() + days);
   return d.toISOString();
