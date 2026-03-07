@@ -40,6 +40,7 @@ export interface MajikFileIdentity {
 export interface MajikFileRecipient {
   /** Base64 SHA-256 of the ML-KEM public key — used to locate the key entry on decrypt. */
   fingerprint: string;
+  publicKey: MajikMessagePublicKey;
   /** ML-KEM-768 public key (1184 bytes). */
   mlKemPublicKey: Uint8Array;
 }
@@ -151,10 +152,14 @@ export interface MajikFileJSON {
   share_token: string | null;
   /** Usage context — determines downstream UX and access control. */
   context: FileContext | null;
-  /** Foreign key → majik_message_chat.id (mutually exclusive with thread_message_id). */
+  /** Foreign key → majik_message_chat.id. */
   chat_message_id: string | null;
-  /** Foreign key → majik_message_thread.id (mutually exclusive with chat_message_id). */
+  /** Foreign key → majik_message_mail.id. */
   thread_message_id: string | null;
+  /** Foreign key → majik_message_thread.id. */
+  thread_id: string | null;
+
+  participants: MajikMessagePublicKey[];
   /**
    * Conversation (channel / DM) ID.
    * Required when context is "chat_image" — used to scope the R2 key:
@@ -223,10 +228,12 @@ export interface CreateOptions {
    * Temporary file duration in days. Required when isTemporary = true.
    */
   expiresAt?: TempFileDuration;
-  /** Associate this file with a chat message (mutually exclusive with threadMessageId). */
+  /** Associate this file with a chat message. */
   chatMessageId?: string;
-  /** Associate this file with a thread message (mutually exclusive with chatMessageId). */
+  /** Associate this file with a thread message. */
   threadMessageId?: string;
+  /** Associate this file with a thread. */
+  threadId?: string;
   /**
    * Conversation (channel / DM) ID.
    * Required when context is "chat_image".

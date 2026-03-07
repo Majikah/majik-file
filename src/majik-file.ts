@@ -51,6 +51,7 @@ import type {
   FileContext,
   StorageType,
   TempFileDuration,
+  MajikMessagePublicKey,
 } from "./core/types";
 import { isMjkbGroupPayload, isMjkbSinglePayload } from "./core/types";
 
@@ -121,7 +122,9 @@ export class MajikFile {
   private readonly _context: FileContext | null;
   private readonly _chatMessageId: string | null;
   private readonly _threadMessageId: string | null;
+  private readonly _threadId: string | null;
   private readonly _conversationId: string | null;
+  private _participants: MajikMessagePublicKey[];
   private _expiresAt: string | null;
   private readonly _timestamp: string | null;
   private _lastUpdate: string | null; // mutable — updated on mutations
@@ -155,7 +158,9 @@ export class MajikFile {
     this._context = json.context;
     this._chatMessageId = json.chat_message_id;
     this._threadMessageId = json.thread_message_id;
+    this._threadId = json.thread_id;
     this._conversationId = json.conversation_id;
+    this._participants = json.participants;
     this._expiresAt = json.expires_at;
     this._timestamp = json.timestamp;
     this._lastUpdate = json.last_update;
@@ -226,6 +231,12 @@ export class MajikFile {
   get threadMessageId(): string | null {
     return this._threadMessageId;
   }
+  get threadId(): string | null {
+    return this._threadId;
+  }
+  get participants(): MajikMessagePublicKey[] {
+    return this._participants;
+  }
   /** Conversation ID — only populated for chat_image context files. */
   get conversationId(): string | null {
     return this._conversationId;
@@ -291,6 +302,7 @@ export class MajikFile {
       expiresAt = 15,
       chatMessageId = null,
       threadMessageId = null,
+      threadId = null,
       conversationId = null,
       userId,
     } = options;
@@ -424,6 +436,20 @@ export class MajikFile {
       );
       assertRecipientLimit(cleanedRecipients);
 
+      // Owner is always the first key entry
+      const allRecipients: MajikFileRecipient[] = [
+        {
+          fingerprint: identity.fingerprint,
+          mlKemPublicKey: identity.mlKemPublicKey,
+          publicKey: identity.publicKey,
+        },
+        ...cleanedRecipients,
+      ];
+
+      const participantPubKeys = allRecipients.map(
+        (recipient) => recipient.publicKey,
+      );
+
       const isGroupFile = cleanedRecipients.length > 0;
 
       let ciphertext: Uint8Array;
@@ -447,15 +473,6 @@ export class MajikFile {
         // Random group AES key encrypts the file once
         const aesKey = generateRandomBytes(AES_KEY_LEN);
         ciphertext = aesGcmEncrypt(aesKey, iv, compressed);
-
-        // Owner is always the first key entry
-        const allRecipients: MajikFileRecipient[] = [
-          {
-            fingerprint: identity.fingerprint,
-            mlKemPublicKey: identity.mlKemPublicKey,
-          },
-          ...recipients,
-        ];
 
         const keys: MajikFileGroupKey[] = allRecipients.map((r) => {
           const { sharedSecret, cipherText: mlKemCT } = mlKemEncapsulate(
@@ -514,10 +531,12 @@ export class MajikFile {
         context,
         chat_message_id: chatMessageId,
         thread_message_id: threadMessageId,
+        thread_id: threadId,
         conversation_id: conversationId,
         expires_at: buildExpiryDate(expiresAt),
         timestamp: now,
         last_update: now,
+        participants: participantPubKeys,
       };
 
       const instance = new MajikFile(json, mjkbBytes, isGroupFile);
@@ -527,6 +546,170 @@ export class MajikFile {
       if (err instanceof MajikFileError) throw err;
       throw MajikFileError.encryptionFailed(err);
     }
+  }
+
+  // ── QUICK-CREATE WRAPPERS ─────────────────────────────────────────────────
+
+  /**
+   * Create a chat image file.
+   * Validates that the file is an image and does not exceed 25 MB (original bytes).
+   */
+  static async createChatImage(options: {
+    data: Uint8Array | ArrayBuffer;
+    userId: string;
+    identity: MajikFileIdentity;
+    conversationId: string;
+    mimeType: string;
+    originalName?: string;
+    recipients?: MajikFileRecipient[];
+    chatMessageId?: string;
+  }): Promise<MajikFile> {
+    const raw =
+      options.data instanceof Uint8Array
+        ? options.data
+        : new Uint8Array(options.data);
+
+    if (!options.mimeType?.startsWith("image/")) {
+      throw MajikFileError.invalidInput(
+        `createChatImage: mimeType must be an image/* type (got "${options.mimeType}")`,
+      );
+    }
+    const CHAT_IMAGE_MAX = 25 * 1024 * 1024; // 25 MB
+    if (raw.byteLength > CHAT_IMAGE_MAX) {
+      throw MajikFileError.sizeExceeded(raw.byteLength, CHAT_IMAGE_MAX);
+    }
+
+    return MajikFile.create({
+      data: raw,
+      userId: options.userId,
+      identity: options.identity,
+      context: "chat_image",
+      conversationId: options.conversationId,
+      mimeType: options.mimeType,
+      originalName: options.originalName,
+      recipients: options.recipients ?? [],
+      chatMessageId: options.chatMessageId,
+      isTemporary: false,
+    });
+  }
+
+  /**
+   * Create a chat attachment file.
+   */
+  static async createChatAttachment(options: {
+    data: Uint8Array | ArrayBuffer;
+    userId: string;
+    identity: MajikFileIdentity;
+    chatMessageId: string;
+    originalName?: string;
+    mimeType?: string;
+    recipients?: MajikFileRecipient[];
+  }): Promise<MajikFile> {
+    return MajikFile.create({
+      data: options.data,
+      userId: options.userId,
+      identity: options.identity,
+      context: "chat_attachment",
+      chatMessageId: options.chatMessageId,
+      originalName: options.originalName,
+      mimeType: options.mimeType,
+      recipients: options.recipients ?? [],
+      isTemporary: false,
+    });
+  }
+
+  /**
+   * Create a thread attachment file.
+   */
+  static async createThreadAttachment(options: {
+    data: Uint8Array | ArrayBuffer;
+    userId: string;
+    identity: MajikFileIdentity;
+    threadId: string;
+    threadMessageId?: string;
+    originalName?: string;
+    mimeType?: string;
+    recipients?: MajikFileRecipient[];
+  }): Promise<MajikFile> {
+    return MajikFile.create({
+      data: options.data,
+      userId: options.userId,
+      identity: options.identity,
+      context: "thread_attachment",
+      threadId: options.threadId,
+      threadMessageId: options.threadMessageId,
+      originalName: options.originalName,
+      mimeType: options.mimeType,
+      recipients: options.recipients ?? [],
+      isTemporary: false,
+    });
+  }
+
+  /**
+   * Create a permanent user upload.
+   */
+  static async createUserUpload(options: {
+    data: Uint8Array | ArrayBuffer;
+    userId: string;
+    identity: MajikFileIdentity;
+    originalName?: string;
+    mimeType?: string;
+    isShared?: boolean;
+    recipients?: MajikFileRecipient[];
+  }): Promise<MajikFile> {
+    return MajikFile.create({
+      data: options.data,
+      userId: options.userId,
+      identity: options.identity,
+      context: "user_upload",
+      originalName: options.originalName,
+      mimeType: options.mimeType,
+      isShared: options.isShared ?? false,
+      recipients: options.recipients ?? [],
+      isTemporary: false,
+    });
+  }
+
+  /**
+   * Create a temporary user upload with a typed TTL.
+   * @param duration  Days until expiry. Defaults to 15.
+   */
+  static async createTemporaryUpload(options: {
+    data: Uint8Array | ArrayBuffer;
+    userId: string;
+    identity: MajikFileIdentity;
+    originalName?: string;
+    mimeType?: string;
+    duration?: TempFileDuration;
+    recipients?: MajikFileRecipient[];
+  }): Promise<MajikFile> {
+    const duration = options.duration ?? 15;
+    return MajikFile.create({
+      data: options.data,
+      userId: options.userId,
+      identity: options.identity,
+      context: "user_upload",
+      originalName: options.originalName,
+      mimeType: options.mimeType,
+      recipients: options.recipients ?? [],
+      isTemporary: true,
+      expiresAt: duration,
+    });
+  }
+
+  // ── PARTICIPANT ACCESS CHECKS ─────────────────────────────────────────────
+
+  /**
+   * Returns true if the given public key string is in the participants list
+   * for this file. O(n) scan — participants lists are small in practice.
+   *
+   * Note: participants contains the *recipients'* public keys. The owner's
+   * key is NOT included (the owner encrypts to themselves via identity, not
+   * via the recipients array). To check owner access use `userIsOwner()`.
+   */
+  hasParticipantAccess(publicKey: MajikMessagePublicKey): boolean {
+    if (!publicKey?.trim()) return false;
+    return this._participants.includes(publicKey);
   }
 
   // ── DECRYPT (static) ──────────────────────────────────────────────────────
@@ -826,6 +1009,8 @@ export class MajikFile {
       context: this._context,
       chat_message_id: this._chatMessageId,
       thread_message_id: this._threadMessageId,
+      thread_id: this._threadId,
+      participants: this._participants,
       conversation_id: this._conversationId,
       expires_at: this._expiresAt,
       timestamp: this._timestamp,
