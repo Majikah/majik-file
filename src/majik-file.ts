@@ -120,10 +120,10 @@ export class MajikFile {
   private _isShared: boolean;
   private _shareToken: string | null;
   private readonly _context: FileContext | null;
-  private readonly _chatMessageId: string | null;
-  private readonly _threadMessageId: string | null;
-  private readonly _threadId: string | null;
-  private readonly _conversationId: string | null;
+  private _chatMessageId: string | null;
+  private _threadMessageId: string | null;
+  private _threadId: string | null;
+  private _conversationId: string | null;
   private _participants: MajikMessagePublicKey[];
   private _expiresAt: string | null;
   private readonly _timestamp: string | null;
@@ -710,6 +710,70 @@ export class MajikFile {
   hasParticipantAccess(publicKey: MajikMessagePublicKey): boolean {
     if (!publicKey?.trim()) return false;
     return this._participants.includes(publicKey);
+  }
+
+  /**
+   * Bind this file to a thread mail after initial creation.
+   * Can only be called once — throws if either ID is already set.
+   * Call toJSON() and persist to Supabase after binding.
+   */
+  bindToThreadMail(threadId: string, threadMessageId: string): void {
+    if (this._context !== "thread_attachment") {
+      throw MajikFileError.invalidInput(
+        "bindToThreadMail: only thread_attachment files can be bound to a mail",
+      );
+    }
+    if (this._threadId || this._threadMessageId) {
+      throw MajikFileError.invalidInput(
+        "bindToThreadMail: this file is already bound to a thread mail — " +
+          "IDs are immutable once set",
+      );
+    }
+    if (!threadId?.trim()) {
+      throw MajikFileError.invalidInput(
+        "bindToThreadMail: threadId is required",
+      );
+    }
+    if (!threadMessageId?.trim()) {
+      throw MajikFileError.invalidInput(
+        "bindToThreadMail: threadMessageId is required",
+      );
+    }
+    this._threadId = threadId;
+    this._threadMessageId = threadMessageId;
+    this._lastUpdate = new Date().toISOString();
+  }
+
+  /**
+   * Bind this file to a chat conversation after initial creation.
+   * Can only be called once — throws if either ID is already set.
+   * Call toJSON() and persist to Supabase after binding.
+   */
+  bindToChatConversation(conversationID: string, chatMessageID: string): void {
+    if (this._context !== "chat_attachment") {
+      throw MajikFileError.invalidInput(
+        "bindToChatConversation: only chat_attachment files can be bound to a mail",
+      );
+    }
+    if (this._chatMessageId || this._conversationId) {
+      throw MajikFileError.invalidInput(
+        "bindToChatConversation: this file is already bound to a chat conversation — " +
+          "IDs are immutable once set",
+      );
+    }
+    if (!conversationID?.trim()) {
+      throw MajikFileError.invalidInput(
+        "bindToChatConversation: conversationID is required",
+      );
+    }
+    if (!chatMessageID?.trim()) {
+      throw MajikFileError.invalidInput(
+        "bindToChatConversation: chatMessageID is required",
+      );
+    }
+    this._conversationId = conversationID;
+    this._chatMessageId = chatMessageID;
+    this._lastUpdate = new Date().toISOString();
   }
 
   // ── DECRYPT (static) ──────────────────────────────────────────────────────
