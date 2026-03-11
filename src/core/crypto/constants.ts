@@ -226,6 +226,7 @@ export const KNOWN_MIME_TYPES = new Set([
 
   // ── Archives & Compressed ────────────────────────────────────────────────
   "application/zip", // .zip
+  "application/x-zip-compressed", // .rar
   "application/x-rar-compressed", // .rar
   "application/x-rar",
   "application/x-7z-compressed", // .7z
@@ -515,6 +516,7 @@ export const INCOMPRESSIBLE_MIME_TYPES = new Set([
   // Archives (already compressed)
   "application/zip",
   "application/gzip",
+  "application/x-zip-compressed",
   "application/x-gzip",
   "application/x-rar-compressed",
   "application/x-rar",

@@ -12,6 +12,7 @@ import {
   ML_KEM_PK_LEN,
   MAX_FILE_SIZE_BYTES,
   R2_PREFIX,
+  MJKB_VERSION,
 } from "./core/crypto/constants";
 import {
   sha256Hex,
@@ -305,6 +306,7 @@ export class MajikFile {
       threadId = null,
       conversationId = null,
       userId,
+      compressionLevel,
     } = options;
 
     // ── Input validation ─────────────────────────────────────────────────
@@ -417,7 +419,7 @@ export class MajikFile {
           ? true
           : shouldCompress(resolvedMimeType);
       const compressed = compressible
-        ? await MajikCompressor.compress(processedBytes)
+        ? await MajikCompressor.compress(processedBytes, compressionLevel)
         : processedBytes;
 
       // ── 4. IV ─────────────────────────────────────────────────────────
@@ -1476,5 +1478,112 @@ export class MajikFile {
       `storage: ${this._storageType}` +
       ` }`
     );
+  }
+
+  /**
+   * Fully validate a .mjkb binary beyond the quick magic-byte check.
+   *
+   * Checks performed (in order):
+   *  1. Minimum byte length for a complete fixed header (21 bytes)
+   *  2. Magic bytes "MJKB" at offset 0
+   *  3. Version byte matches MJKB_VERSION (0x01)
+   *  4. Payload JSON length field is positive and not larger than remaining data
+   *  5. Payload JSON is valid UTF-8 and parses without error
+   *  6. Parsed payload is either a MjkbSinglePayload or MjkbGroupPayload shape
+   *  7. Ciphertext section is non-empty (at least 1 byte after the payload)
+   *
+   * Unlike isMjkbCandidate(), this method parses the full header. It does NOT
+   * attempt decryption — use decrypt() for cryptographic verification.
+   *
+   * @param data  Raw bytes to inspect. Accepts Uint8Array or ArrayBuffer.
+   * @returns     true if the binary is structurally valid; false otherwise.
+   */
+  static isValidMJKB(data: Uint8Array | ArrayBuffer): boolean {
+    try {
+      const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+
+      // 1. Minimum size: 4 magic + 1 version + 12 IV + 4 payload-len = 21 bytes,
+      //    plus at least 1 byte of payload JSON and 1 byte of ciphertext.
+      if (bytes.length < 23) return false;
+
+      // 2. Magic bytes
+      if (
+        bytes[0] !== 0x4d || // M
+        bytes[1] !== 0x4a || // J
+        bytes[2] !== 0x4b || // K
+        bytes[3] !== 0x42 // B
+      )
+        return false;
+
+      // 3. Version
+      if (bytes[4] !== MJKB_VERSION) return false;
+
+      // Skip IV (bytes 5–16) — we don't validate randomness, only structure.
+      const payloadLenOffset = 17; // 4 magic + 1 version + 12 IV
+
+      // 4. Payload JSON length (big-endian uint32)
+      const payloadLen =
+        (bytes[payloadLenOffset] << 24) |
+        (bytes[payloadLenOffset + 1] << 16) |
+        (bytes[payloadLenOffset + 2] << 8) |
+        bytes[payloadLenOffset + 3];
+
+      if (payloadLen <= 0) return false;
+
+      const payloadStart = payloadLenOffset + 4; // 21
+      const ciphertextStart = payloadStart + payloadLen;
+
+      // Ensure the declared payload fits and leaves at least 1 byte for ciphertext
+      if (ciphertextStart >= bytes.length) return false;
+
+      // 5. Payload JSON must parse
+      let payload: unknown;
+      try {
+        payload = JSON.parse(
+          new TextDecoder().decode(bytes.slice(payloadStart, ciphertextStart)),
+        );
+      } catch {
+        return false;
+      }
+
+      if (!payload || typeof payload !== "object") return false;
+
+      // 6. Must be a recognisable single or group payload shape
+      const isSingle =
+        "mlKemCipherText" in (payload as object) &&
+        !("keys" in (payload as object));
+      const isGroup =
+        "keys" in (payload as object) &&
+        Array.isArray((payload as { keys: unknown }).keys) &&
+        (payload as { keys: unknown[] }).keys.length > 0;
+
+      if (!isSingle && !isGroup) return false;
+
+      // 7. Ciphertext section must be non-empty
+      if (bytes.length <= ciphertextStart) return false;
+
+      return true;
+    } catch {
+      // Any unexpected error → not a valid .mjkb
+      return false;
+    }
+  }
+
+  /**
+   * Return the raw plaintext byte size of a Uint8Array or ArrayBuffer.
+   *
+   * This is a cheap O(1) helper — it reads `.byteLength` without copying.
+   * Use it to inspect file size before calling create() or to feed into
+   * `MajikCompressor.adaptiveLevel()` for manual level selection.
+   *
+   * @param data  Raw bytes — typically the plaintext before encryption.
+   * @returns     Byte length as a plain number.
+   *
+   * @example
+   * const size = MajikFile.getRawFileSize(rawBytes);
+   * const level = MajikCompressor.adaptiveLevel(rawBytes, CompressionPreset.ULTRA);
+   */
+  static getRawFileSize(data: Uint8Array | ArrayBuffer): number {
+    return data instanceof Uint8Array ? data.byteLength : data.byteLength;
   }
 }

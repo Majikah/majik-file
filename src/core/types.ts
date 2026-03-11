@@ -1,3 +1,5 @@
+import { CompressionLevel } from "./compressor/majik-compressor";
+
 export type MajikMessagePublicKey = string;
 
 // ─── Domain Types ─────────────────────────────────────────────────────────────
@@ -240,6 +242,25 @@ export interface CreateOptions {
    * Determines the R2 key prefix: images/chats/<conversationId>/
    */
   conversationId?: string;
+  /**
+   * Zstd compression level or preset for this file.
+   *
+   * Accepts either a raw integer (`CompressionLevel` 1–22) or a named
+   * `CompressionPreset` value. The level is always run through
+   * `MajikCompressor.adaptiveLevel()` before use, so it will be silently
+   * clamped downward for large files to avoid WASM out-of-memory errors.
+   *
+   * Defaults to ZSTD_MAX_LEVEL (22) when omitted — existing behaviour.
+   *
+   * @example
+   * // Raw integer
+   * compressionLevel: 9
+   *
+   * // Named preset
+   * compressionLevel: CompressionPreset.GOOD  // 9
+   * compressionLevel: CompressionPreset.BALANCED // 6
+   */
+  compressionLevel?: CompressionLevel | number;
 }
 
 // ─── Decoded .mjkb Binary ─────────────────────────────────────────────────────
