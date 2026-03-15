@@ -13,6 +13,9 @@ import {
   MAX_FILE_SIZE_BYTES,
   R2_PREFIX,
   MJKB_VERSION,
+  MJKS_OVERHEAD,
+  MJKS_MAGIC_LEN,
+  MJKS_MAGIC,
 } from "./core/crypto/constants";
 import {
   sha256Hex,
@@ -895,7 +898,10 @@ export class MajikFile {
     }
 
     try {
-      const raw = await normaliseToUint8ArrayAsync(source);
+      const raw = this.stripMjksTrailer(
+        await normaliseToUint8ArrayAsync(source),
+      );
+
       const { iv, payload, ciphertext } = decodeMjkb(raw);
 
       let aesKey: Uint8Array;
@@ -1000,7 +1006,9 @@ export class MajikFile {
     }
 
     try {
-      const raw = await normaliseToUint8ArrayAsync(source);
+      const raw = this.stripMjksTrailer(
+        await normaliseToUint8ArrayAsync(source),
+      );
       const { iv, payload, ciphertext } = decodeMjkb(raw);
 
       let aesKey: Uint8Array;
@@ -1272,6 +1280,102 @@ export class MajikFile {
   toMJKB(): Blob {
     if (!this._binary) throw MajikFileError.missingBinary();
     return new Blob([this._binary as BlobPart], {
+      type: "application/octet-stream",
+    });
+  }
+
+  /**
+   * Returns true if the binary has a MJKS signed trailer appended.
+   * O(1) — checks only the last 4 bytes.
+   */
+  static hasMjksTrailer(data: Uint8Array): boolean {
+    if (data.length < MJKS_OVERHEAD + 23) return false; // 23 = min valid .mjkb
+    const tail = data.subarray(data.length - MJKS_MAGIC_LEN);
+    return (
+      tail[0] === 0x4d &&
+      tail[1] === 0x4a &&
+      tail[2] === 0x4b &&
+      tail[3] === 0x53
+    );
+  }
+
+  /**
+   * Extract the embedded MajikSignature from a MJKS-trailered binary.
+   * Returns null if no trailer is present or the JSON is malformed.
+   */
+  static extractMjksSignature(data: Uint8Array): MajikSignature | null {
+    if (!MajikFile.hasMjksTrailer(data)) return null;
+    try {
+      const lengthOffset = data.length - MJKS_OVERHEAD;
+      const sigLen =
+        (data[lengthOffset] << 24) |
+        (data[lengthOffset + 1] << 16) |
+        (data[lengthOffset + 2] << 8) |
+        data[lengthOffset + 3];
+
+      if (sigLen <= 0 || sigLen > data.length - MJKS_OVERHEAD) return null;
+
+      const sigStart = data.length - MJKS_OVERHEAD - sigLen;
+      const sigBytes = data.subarray(sigStart, sigStart + sigLen);
+      const sigJson = new TextDecoder().decode(sigBytes);
+      return MajikSignature.fromJSON(JSON.parse(sigJson));
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Strip the MJKS trailer and return the original .mjkb bytes.
+   * If no trailer is present, returns the input unchanged (safe to call unconditionally).
+   */
+  static stripMjksTrailer(data: Uint8Array): Uint8Array {
+    if (!MajikFile.hasMjksTrailer(data)) return data;
+    const lengthOffset = data.length - MJKS_OVERHEAD;
+    const sigLen =
+      (data[lengthOffset] << 24) |
+      (data[lengthOffset + 1] << 16) |
+      (data[lengthOffset + 2] << 8) |
+      data[lengthOffset + 3];
+    return data.subarray(0, data.length - MJKS_OVERHEAD - sigLen);
+  }
+
+  /**
+   * Export the encrypted binary with the attached MajikSignature appended
+   * as a MJKS trailer. Offline recipients can extract and verify the
+   * signature without a Supabase round-trip.
+   *
+   * Format: [.mjkb bytes][sig JSON UTF-8][uint32 BE sig length]["MJKS"]
+   *
+   * The base .mjkb bytes are identical to toMJKB() — decryption tools that
+   * don't understand the trailer can strip it with stripMjksTrailer() or
+   * simply use decrypt() which calls stripMjksTrailer() automatically.
+   *
+   * @throws MajikFileError if _binary is not loaded or no signature is attached.
+   */
+  toSignedMJKB(): Blob {
+    if (!this._binary) throw MajikFileError.missingBinary();
+    if (!this._signature?.trim()) {
+      throw MajikFileError.invalidInput(
+        "toSignedMJKB: no signature attached — call sign() or createAndSign() first",
+      );
+    }
+
+    const sigBytes = new TextEncoder().encode(
+      JSON.stringify(MajikSignature.deserialize(this._signature).toJSON()),
+    );
+
+    const trailer = new Uint8Array(sigBytes.length + MJKS_OVERHEAD);
+    trailer.set(sigBytes, 0);
+    // uint32 BE length
+    const len = sigBytes.length;
+    trailer[len] = (len >>> 24) & 0xff;
+    trailer[len + 1] = (len >>> 16) & 0xff;
+    trailer[len + 2] = (len >>> 8) & 0xff;
+    trailer[len + 3] = len & 0xff;
+    // "MJKS" magic suffix
+    trailer.set(MJKS_MAGIC, len + 4);
+
+    return new Blob([this._binary as BlobPart, trailer], {
       type: "application/octet-stream",
     });
   }
@@ -1890,6 +1994,56 @@ export class MajikFile {
       return MajikSignature.verifyWithKey(plaintext, sig, keyOrPublicKeys);
     }
     return MajikSignature.verify(plaintext, sig, keyOrPublicKeys);
+  }
+
+  /**
+   * Verify the MJKS trailer signature on a signed .mjkb binary in one call.
+   *
+   * This is the offline verification path — no Supabase or MajikFile instance
+   * needed. Pass the raw bytes downloaded from R2 (or shared directly) and the
+   * signer's public keys.
+   *
+   * Steps:
+   *  1. Check for a MJKS trailer — throws if none found
+   *  2. Extract the embedded MajikSignature from the trailer
+   *  3. Strip the trailer to recover the original .mjkb bytes
+   *  4. Verify the signature against those stripped bytes
+   *
+   * Note: this verifies the encrypted binary, not the plaintext. That is
+   * intentional — it proves the ciphertext hasn't been tampered with since
+   * signing, without requiring decryption. For plaintext verification use
+   * verifyBinary() on a loaded instance after decryption.
+   *
+   * @param source          Raw signed .mjkb bytes (Blob, Uint8Array, or ArrayBuffer).
+   * @param keyOrPublicKeys MajikKey instance (locked or unlocked) or raw public keys.
+   * @returns               VerificationResult with valid: true/false and envelope metadata.
+   * @throws MajikFileError if no MJKS trailer is found or the trailer is malformed.
+   */
+  static async verifySignedMJKB(
+    source: Blob | Uint8Array | ArrayBuffer,
+    keyOrPublicKeys: MajikKey | MajikSignerPublicKeys,
+  ): Promise<VerificationResult> {
+    const data = await normaliseToUint8ArrayAsync(source);
+
+    if (!MajikFile.hasMjksTrailer(data)) {
+      throw MajikFileError.invalidInput(
+        "verifySignedMJKB: no MJKS trailer found — use toSignedMJKB() to export a signed file",
+      );
+    }
+
+    const sig = MajikFile.extractMjksSignature(data);
+    if (!sig) {
+      throw MajikFileError.invalidInput(
+        "verifySignedMJKB: MJKS trailer present but signature could not be parsed",
+      );
+    }
+
+    const mjkbBytes = MajikFile.stripMjksTrailer(data);
+
+    if (MajikFile._isMajikKey(keyOrPublicKeys)) {
+      return MajikSignature.verifyWithKey(mjkbBytes, sig, keyOrPublicKeys);
+    }
+    return MajikSignature.verify(mjkbBytes, sig, keyOrPublicKeys);
   }
 
   /**

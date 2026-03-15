@@ -51,6 +51,14 @@ export const ZSTD_MAX_LEVEL = 22;
 /** Default maximum file size: 100 MB in bytes. Bypassable via CreateOptions. */
 export const MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024;
 
+// ── MJKS trailer constants ────────────────────────────────────────────────
+
+export const MJKS_MAGIC = new Uint8Array([0x4d, 0x4a, 0x4b, 0x53]); // "MJKS"
+export const MJKS_MAGIC_LEN = 4;
+export const MJKS_LENGTH_LEN = 4; // uint32 BE
+export const MJKS_OVERHEAD = 8;   // length field + magic suffix
+
+
 // ─── R2 Storage Prefixes ─────────────────────────────────────────────────────
 
 /**
