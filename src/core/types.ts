@@ -175,6 +175,9 @@ export interface MajikFileJSON {
   timestamp: string | null;
   /** ISO-8601 last-update timestamp. Updated on any mutation (e.g. toggleSharing). */
   last_update: string | null;
+
+  // MajikFileJSON
+  signature: string | null; // base64 — MajikSignature.serialize() output
 }
 
 // ─── CreateOptions ────────────────────────────────────────────────────────────
@@ -303,4 +306,12 @@ export interface MajikFileStats {
   expiresAt: string | null;
   timestamp: string | null;
   r2Key: string;
+  isSigned: boolean;
+}
+
+export interface FileSignature {
+  signerId: string;
+  timestamp: string;
+  contentType?: string;
+  contentHash: string;
 }

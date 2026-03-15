@@ -53,8 +53,15 @@ import type {
   StorageType,
   TempFileDuration,
   MajikMessagePublicKey,
+  FileSignature,
 } from "./core/types";
 import { isMjkbGroupPayload, isMjkbSinglePayload } from "./core/types";
+import {
+  MajikSignature,
+  type MajikSignerPublicKeys,
+  type VerificationResult,
+} from "@majikah/majik-signature";
+import { MajikKey } from "@majikah/majik-key";
 
 /**
  * MajikFile
@@ -131,6 +138,8 @@ export class MajikFile {
   private _lastUpdate: string | null; // mutable — updated on mutations
   private readonly _isGroup: boolean; // derived from payload type at create/parse time
 
+  private _signature: string | null;
+
   /**
    * Encrypted .mjkb binary.
    * NOT serialised to JSON / Supabase — lives in R2 storage only.
@@ -167,6 +176,7 @@ export class MajikFile {
     this._lastUpdate = json.last_update;
     this._binary = binary;
     this._isGroup = isGroup;
+    this._signature = json.signature;
   }
 
   // ── Getters ───────────────────────────────────────────────────────────────
@@ -262,6 +272,38 @@ export class MajikFile {
   /** True if this file was encrypted for a single recipient (the owner). */
   get isSingle(): boolean {
     return !this._isGroup;
+  }
+
+  // ── SIGNATURE ─────────────────────────────────────────────────────────────
+
+  /**
+   * Serialized base64 signature string (MajikSignature.serialize() output).
+   * Stored in Supabase as a plain text column. Null when unsigned.
+   */
+  get signatureRaw(): string | null {
+    return this._signature;
+  }
+
+  /**
+   * Deserialize and return the attached MajikSignature instance.
+   * Returns null if no signature is attached or the stored value is malformed.
+   * Deserializes on every access — avoid calling in tight loops.
+   */
+  get signature(): MajikSignature | null {
+    if (!this._signature?.trim()) return null;
+    try {
+      return MajikSignature.deserialize(this._signature);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Returns true if a structurally valid signature is attached.
+   * Does NOT cryptographically verify — call verify() for that.
+   */
+  get isSigned(): boolean {
+    return this._signature?.trim() ? true : false;
   }
 
   // ── CREATE ────────────────────────────────────────────────────────────────
@@ -539,6 +581,7 @@ export class MajikFile {
         timestamp: now,
         last_update: now,
         participants: participantPubKeys,
+        signature: null,
       };
 
       const instance = new MajikFile(json, mjkbBytes, isGroupFile);
@@ -548,6 +591,45 @@ export class MajikFile {
       if (err instanceof MajikFileError) throw err;
       throw MajikFileError.encryptionFailed(err);
     }
+  }
+
+  // ── CREATE AND SIGN ───────────────────────────────────────────────────────
+
+  /**
+   * Encrypt a raw binary file, sign the resulting .mjkb binary, and return
+   * the MajikFile instance with the signature already attached.
+   *
+   * This is a convenience wrapper around create() + sign() for the common
+   * case where the file owner wants to sign immediately after encryption.
+   *
+   * The signature covers the encrypted .mjkb binary bytes — not the
+   * plaintext — so verification can be performed by any party holding the
+   * signer's public keys without requiring decryption. See sign() for the
+   * full rationale.
+   *
+   * Typical usage:
+   *   const file = await MajikFile.createAndSign(options, key);
+   *   await r2.put(file.r2Key, file.toMJKB());
+   *   await supabase.from("majik_files").insert(file.toJSON());
+   *   // toJSON() includes the serialized signature — one round-trip to Supabase.
+   *
+   * @param options  Same CreateOptions accepted by create().
+   * @param key      Unlocked MajikKey with signing keys (Ed25519 + ML-DSA-87).
+   * @param signOptions  Optional content type label and timestamp override.
+   * @returns        MajikFile instance with _signature populated and _binary loaded.
+   * @throws MajikFileError on any encryption or validation failure.
+   * @throws MajikSignatureKeyError if the key is locked or missing signing keys.
+   */
+  static async createAndSign(
+    options: CreateOptions,
+    key: MajikKey,
+    signOptions?: { contentType?: string; timestamp?: string },
+  ): Promise<MajikFile> {
+    const file = await MajikFile.create(options);
+    // _binary is guaranteed non-null here — create() always populates it
+    // and the instance was just constructed, so clearBinary() hasn't run.
+    await file.sign(key, signOptions);
+    return file;
   }
 
   // ── QUICK-CREATE WRAPPERS ─────────────────────────────────────────────────
@@ -876,23 +958,33 @@ export class MajikFile {
 
   /**
    * Decrypt a .mjkb binary and return the raw bytes together with the
-   * original filename and MIME type that were embedded in the payload at
-   * encryption time.
+   * original filename, MIME type, and any attached signature that was
+   * embedded in the Supabase record at encryption time.
+   *
+   * Signature handling:
+   *   - If a signature string is provided via `signatureRaw`, it is
+   *     deserialized and returned as `signature` for the caller to verify.
+   *   - If no signature is present, `signature` is null — the rest of the
+   *     return shape is unchanged so existing call sites need no updates.
+   *   - This method does NOT verify the signature. To verify, pass the
+   *     returned signature to file.verify() or MajikSignature.verify().
    *
    * This is the preferred method for the File Vault UI because it avoids a
    * second parse of the binary — everything comes from the single decodeMjkb
    * call that decryption already performs.
    *
-   * @returns `{ bytes, originalName, mimeType }` where `originalName` and
-   *          `mimeType` may be null if the file was encrypted without metadata.
+   * @returns `{ bytes, originalName, mimeType, signature }` where
+   *          `originalName`, `mimeType`, and `signature` may be null.
    */
   static async decryptWithMetadata(
     source: Blob | Uint8Array | ArrayBuffer,
     identity: Pick<MajikFileIdentity, "fingerprint" | "mlKemSecretKey">,
+    signatureRaw?: string | null,
   ): Promise<{
     bytes: Uint8Array;
     originalName: string | null;
     mimeType: string | null;
+    signature: MajikSignature | null;
   }> {
     if (!identity)
       throw MajikFileError.invalidInput("identity is required for decryption");
@@ -958,18 +1050,53 @@ export class MajikFile {
         ? await MajikCompressor.decompress(decrypted)
         : decrypted;
 
-      // Extract original filename and MIME type from the payload.
-      // Written at encryption time as short keys n/m to keep the binary compact.
-      // Older .mjkb files without these fields return null — callers should fall
-      // back to stripping ".mjkb" from the filename and using "application/octet-stream".
       const originalName = payload.n;
       const mimeType = payload.m;
 
-      return { bytes, originalName, mimeType };
+      // ── Signature ─────────────────────────────────────────────────────────
+      // Deserialize if a raw signature string was provided. Malformed values
+      // are silently swallowed — the caller receives null and can decide
+      // whether to treat that as an error based on their own policy.
+      let signature: MajikSignature | null = null;
+      if (signatureRaw?.trim()) {
+        try {
+          signature = MajikSignature.deserialize(signatureRaw);
+        } catch {
+          signature = null;
+        }
+      }
+
+      return { bytes, originalName, mimeType, signature };
     } catch (err) {
       if (err instanceof MajikFileError) throw err;
       throw MajikFileError.decryptionFailed("File decryption failed", err);
     }
+  }
+
+  // Fix 1 — instance wrapper for decryptWithMetadata
+  // Add alongside decryptBinary() in the DECRYPT section
+
+  /**
+   * Instance wrapper around MajikFile.decryptWithMetadata() that automatically
+   * passes the attached signature for deserialization.
+   * Convenience method — avoids manually threading signatureRaw at call sites.
+   *
+   * @throws MajikFileError if _binary is not loaded or decryption fails.
+   */
+  async decryptWithMetadata(
+    identity: Pick<MajikFileIdentity, "fingerprint" | "mlKemSecretKey">,
+  ): Promise<{
+    bytes: Uint8Array;
+    originalName: string | null;
+    mimeType: string | null;
+    signature: MajikSignature | null;
+  }> {
+    if (!this._binary) throw MajikFileError.missingBinary();
+    return MajikFile.decryptWithMetadata(
+      this._binary,
+      identity,
+      this._signature,
+    );
   }
 
   /**
@@ -1081,6 +1208,7 @@ export class MajikFile {
       expires_at: this._expiresAt,
       timestamp: this._timestamp,
       last_update: this._lastUpdate,
+      signature: this._signature ?? null,
     };
   }
 
@@ -1408,6 +1536,7 @@ export class MajikFile {
       expiresAt: this._expiresAt,
       timestamp: this._timestamp,
       r2Key: this._r2Key,
+      isSigned: this.isSigned,
     };
   }
 
@@ -1475,7 +1604,8 @@ export class MajikFile {
       `hash: ${this._fileHash.slice(0, 8)}…, ` +
       `size: ${formatBytes(this._sizeOriginal)}, ` +
       `type: ${this._isGroup ? "group" : "single"}, ` +
-      `storage: ${this._storageType}` +
+      `storage: ${this._storageType}, ` +
+      `signed: ${this.isSigned}` +
       ` }`
     );
   }
@@ -1585,5 +1715,219 @@ export class MajikFile {
    */
   static getRawFileSize(data: Uint8Array | ArrayBuffer): number {
     return data instanceof Uint8Array ? data.byteLength : data.byteLength;
+  }
+
+  /**
+   * Attach a pre-computed MajikSignature to this file.
+   * Replaces any existing signature — idempotent re-signing is safe.
+   * Call toJSON() and persist to Supabase after attaching.
+   *
+   * Use this when you have already called MajikSignature.sign() yourself
+   * and want to store the result. For a one-shot sign + attach, use sign().
+   *
+   * @param signature  MajikSignature instance or its serialized base64 string.
+   * @throws MajikFileError if the value is an empty string.
+   */
+  attachSignature(signature: MajikSignature | string): void {
+    if (typeof signature === "string") {
+      if (!signature.trim()) {
+        throw MajikFileError.invalidInput(
+          "attachSignature: signature string must be non-empty",
+        );
+      }
+      // Validate the string is actually deserializable before storing
+      try {
+        MajikSignature.deserialize(signature);
+      } catch (err) {
+        throw MajikFileError.invalidInput(
+          `attachSignature: signature string is not a valid serialized MajikSignature — ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+      this._signature = signature;
+    } else {
+      this._signature = signature.serialize();
+    }
+    this._lastUpdate = new Date().toISOString();
+  }
+
+  /**
+   * Remove the attached signature from this file.
+   * No-op if no signature is attached.
+   * Call toJSON() and persist to Supabase after removing.
+   */
+  removeSignature(): void {
+    if (this._signature === null) return;
+    this._signature = null;
+    this._lastUpdate = new Date().toISOString();
+  }
+
+  /**
+   * Sign the loaded .mjkb binary and attach the resulting signature.
+   *
+   * The signature covers the encrypted binary bytes — exactly what is
+   * stored in R2. This means verification does not require decryption:
+   * any party with the signer's public keys can verify storage integrity
+   * without access to the ML-KEM secret key.
+   *
+   * Signing the encrypted binary (not the plaintext) is intentional:
+   *   - The binary is the canonical artifact — it's what gets stored, fetched,
+   *     and transferred. Signing it proves the ciphertext hasn't been tampered
+   *     with since the owner created it.
+   *   - Verification requires no decryption, making it safe to run in
+   *     public/server contexts that only have the signer's public keys.
+   *   - If you need to prove plaintext authenticity, use verifyBinary()
+   *     which decrypts first and then checks the hash.
+   *
+   * Replaces any existing signature — re-signing after mutations is safe
+   * as long as the binary has not changed (binaries are write-once).
+   *
+   * @param key      Unlocked MajikKey with signing keys (Ed25519 + ML-DSA-87).
+   * @param options  Optional content type label and timestamp override.
+   * @returns        The attached MajikSignature instance.
+   * @throws MajikFileError if the binary is not loaded.
+   * @throws MajikSignatureKeyError if the key is locked or missing signing keys.
+   */
+  async sign(
+    key: MajikKey,
+    options?: { contentType?: string; timestamp?: string },
+  ): Promise<MajikSignature> {
+    if (!this._binary) {
+      throw MajikFileError.missingBinary();
+    }
+    const sig = await MajikSignature.sign(this._binary, key, {
+      contentType: options?.contentType ?? this._mimeType ?? undefined,
+      timestamp: options?.timestamp,
+    });
+    this.attachSignature(sig);
+    return sig;
+  }
+
+  /**
+   * Verify the attached signature against the loaded .mjkb binary.
+   *
+   * Requires the binary to be loaded in memory (_binary !== null).
+   * Returns null instead of throwing when the binary is absent or no
+   * signature is attached — callers can treat null as "cannot verify."
+   *
+   * To distinguish "unsigned" from "binary not loaded", check isSigned
+   * before calling:
+   *
+   *   if (!file.isSigned) // definitively unsigned
+   *   const result = file.verify(key);
+   *   if (result === null) // binary not loaded — fetch from R2 first
+   *   if (!result.valid)   // signature present but verification failed
+   *
+   * For full plaintext verification (decrypt then verify), use verifyBinary().
+   *
+   * @param keyOrPublicKeys  MajikKey instance (locked or unlocked) or raw public keys.
+   * @returns VerificationResult, or null if unsigned or binary not loaded.
+   */
+  verify(
+    keyOrPublicKeys: MajikKey | MajikSignerPublicKeys,
+  ): VerificationResult | null {
+    if (!this._signature?.trim()) return null;
+    if (!this._binary) return null;
+
+    let sig: MajikSignature;
+    try {
+      sig = MajikSignature.deserialize(this._signature);
+    } catch {
+      return null;
+    }
+
+    if (MajikFile._isMajikKey(keyOrPublicKeys)) {
+      return MajikSignature.verifyWithKey(this._binary, sig, keyOrPublicKeys);
+    }
+    return MajikSignature.verify(this._binary, sig, keyOrPublicKeys);
+  }
+
+  /**
+   * Full binary verification — decrypts the loaded .mjkb binary and verifies
+   * the signature against the recovered plaintext bytes.
+   *
+   * Use this when you want cryptographic proof that:
+   *   1. The ciphertext decrypts correctly (ML-KEM + AES-GCM authentication passes)
+   *   2. The decrypted plaintext matches what the signer originally signed
+   *
+   * This is the strongest verification path but requires both the identity
+   * (to decrypt) and the signer's public keys (to verify).
+   *
+   * @param identity         ML-KEM identity for decryption.
+   * @param keyOrPublicKeys  Signer's public keys for signature verification.
+   * @returns VerificationResult with valid: true/false.
+   * @throws MajikFileError if binary is not loaded or no signature is attached.
+   */
+  async verifyBinary(
+    identity: Pick<MajikFileIdentity, "fingerprint" | "mlKemSecretKey">,
+    keyOrPublicKeys: MajikKey | MajikSignerPublicKeys,
+  ): Promise<VerificationResult> {
+    if (!this._binary) {
+      throw MajikFileError.missingBinary();
+    }
+    if (!this._signature?.trim()) {
+      throw MajikFileError.invalidInput(
+        "verifyBinary: this file has no attached signature",
+      );
+    }
+
+    let sig: MajikSignature;
+    try {
+      sig = MajikSignature.deserialize(this._signature);
+    } catch (err) {
+      throw MajikFileError.invalidInput(
+        `verifyBinary: stored signature is corrupt — ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+
+    // Decrypt to recover plaintext bytes, then verify signature against them
+    const plaintext = await MajikFile.decrypt(this._binary, identity);
+
+    if (MajikFile._isMajikKey(keyOrPublicKeys)) {
+      return MajikSignature.verifyWithKey(plaintext, sig, keyOrPublicKeys);
+    }
+    return MajikSignature.verify(plaintext, sig, keyOrPublicKeys);
+  }
+
+  /**
+   * Extract envelope metadata from the attached signature without full
+   * cryptographic verification. Useful for displaying signer info in a UI
+   * (e.g. "Signed by business@thezelijah.world on 2025-01-01") before deciding
+   * whether to run the more expensive verify() call.
+   *
+   * Returns null if no signature is attached or the stored value is malformed.
+   */
+  getSignatureInfo(): FileSignature | null {
+    if (!this._signature?.trim()) return null;
+    try {
+      const sig = MajikSignature.deserialize(this._signature);
+      return {
+        signerId: sig.signerId,
+        timestamp: sig.timestamp,
+        contentType: sig.contentType,
+        contentHash: sig.contentHash,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  // ── Private signature helpers ─────────────────────────────────────────────
+
+  /**
+   * Duck-type check to distinguish MajikKey from MajikSignerPublicKeys.
+   * Mirrors the same helper in MajikSignature — kept private here to avoid
+   * exposing key-type discrimination on the public API.
+   */
+  private static _isMajikKey(
+    v: MajikKey | MajikSignerPublicKeys,
+  ): v is MajikKey {
+    // MajikKey carries `fingerprint`; MajikSignerPublicKeys uses `signerId`.
+    // This distinction is what makes the duck-type safe — if MajikSignerPublicKeys
+    // ever gains a `fingerprint` field this check must be updated.
+    return typeof (v as MajikKey).fingerprint === "string";
   }
 }
