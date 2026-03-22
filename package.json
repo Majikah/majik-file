@@ -52,8 +52,8 @@
   },
   "dependencies": {
     "@bokuweb/zstd-wasm": "^0.0.27",
-    "@majikah/majik-key": "^0.2.0",
-    "@majikah/majik-signature": "^0.0.6",
+    "@majikah/majik-key": "^0.2.3",
+    "@majikah/majik-signature": "^0.0.10",
     "@noble/post-quantum": "^0.5.4",
     "@scure/bip39": "^1.6.0",
     "@stablelib/aes": "^2.0.1",
