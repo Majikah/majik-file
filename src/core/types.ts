@@ -7,7 +7,8 @@ export type MajikMessagePublicKey = string;
 export type FileContext =
   | "user_upload"
   | "chat_attachment"
-  | "chat_image" // rasterised WebP image sent in a chat conversation
+  | "chat_image"
+  | "chat_voice"
   | "thread_attachment";
 
 export type StorageType = "permanent" | "temporary";
