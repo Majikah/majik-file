@@ -2,6 +2,9 @@
 
 [![Developed by Zelijah](https://img.shields.io/badge/Developed%20by-Zelijah-red?logo=github&logoColor=white)](https://thezelijah.world) ![GitHub Sponsors](https://img.shields.io/github/sponsors/jedlsf?style=plastic&label=Sponsors&link=https%3A%2F%2Fgithub.com%2Fsponsors%2Fjedlsf)
 
+
+[![Static Badge](https://img.shields.io/badge/IANA-vnd.majikah.bundle-green)](https://www.iana.org/assignments/media-types/application/vnd.majikah.bundle)
+
 Post-quantum file encryption for the Majik Message platform. Produces self-contained `.mjkb` binary files — sealed with **ML-KEM-768 + AES-256-GCM**, optionally Zstd-compressed, readable without any network access.
 
 This library is designed to work within the **Majik Message ecosystem**. It expects callers to supply ML-KEM-768 key material from an identity store; it does not generate or persist keys itself.
@@ -25,7 +28,9 @@ Contents
     - [Decrypt a file](#decrypt-a-file)
     - [Encrypt for multiple recipients](#encrypt-for-multiple-recipients)
     - [Temporary files](#temporary-files)
-    - [Chat images](#chat-images)
+    - [Chat Images](#chat-images)
+    - [Chat Attachment](#chat-attachment)
+    - [Chat Voice](#chat-voice)
   - [API reference](#api-reference)
     - [`MajikFile.create(options)`](#majikfilecreateoptions)
       - [`CreateOptions`](#createoptions)
@@ -263,7 +268,7 @@ const majikFile = await MajikFile.create({
 })
 ```
 
-### Chat images
+### Chat Images
 
 ```typescript
 const majikFile = await MajikFile.create({
@@ -272,6 +277,29 @@ const majikFile = await MajikFile.create({
   context: 'chat_image',         // triggers automatic WebP conversion
   conversationId: 'conv-uuid',   // required for chat_image
   mimeType: 'image/png',
+})
+```
+
+### Chat Attachment
+
+```typescript
+const majikFile = await MajikFile.create({
+  data: imageBytes,
+  identity,
+  context: 'chat_attachment', 
+  conversationId: 'conv-uuid',   // required for chat_attachment
+})
+```
+
+
+### Chat Voice
+
+```typescript
+const majikFile = await MajikFile.create({
+  data: imageBytes,
+  identity,
+  context: 'chat_voice', 
+  conversationId: 'conv-uuid',   // required for chat_voice
 })
 ```
 
@@ -293,7 +321,7 @@ Encrypts raw bytes and returns a `MajikFile` instance with both `_binary` (the `
 |---|---|---|---|
 | `data` | `Uint8Array \| ArrayBuffer` | ✓ | Raw file bytes to encrypt |
 | `identity` | `MajikFileIdentity` | ✓ | Owner's full identity (both keys) |
-| `context` | `FileContext` | ✓ | `user_upload` \| `chat_attachment` \| `chat_image` \| `thread_attachment` |
+| `context` | `FileContext` | ✓ | `user_upload` \| `chat_attachment` \| `chat_voice` \| `chat_image` \| `thread_attachment` |
 | `recipients` | `MajikFileRecipient[]` | — | Additional recipients. Empty → single-recipient mode |
 | `originalName` | `string` | — | Original filename (e.g. `"photo.png"`). Embedded in `.mjkb` payload |
 | `mimeType` | `string` | — | MIME type. Inferred from `originalName` extension if omitted |
@@ -311,7 +339,8 @@ Encrypts raw bytes and returns a `MajikFile` instance with both `_binary` (the `
 | Context | WebP conversion | R2 prefix |
 |---|---|---|
 | `user_upload` | No | `files/user/<userId>/<hash>.mjkb` |
-| `chat_attachment` | Yes (images only) | `files/user/<userId>/<hash>.mjkb` |
+| `chat_attachment` | Yes (images only) | `files/public/1/<userId>_<hash>.mjkb` |
+| `chat_voice` | No | `files/public/1/<userId>_<hash>.mjkb` |
 | `chat_image` | Yes (always) | `images/chats/<conversationId>/<userId>_<hash>.mjkb` |
 | `thread_attachment` | No | `files/user/<userId>/<hash>.mjkb` |
 

@@ -375,6 +375,7 @@ export class MajikFile {
         "user_upload",
         "chat_attachment",
         "chat_image",
+        "chat_voice",
         "thread_attachment",
       ].includes(context)
     ) {
@@ -385,6 +386,19 @@ export class MajikFile {
         'conversationId is required when context is "chat_image"',
       );
     }
+
+    if (context === "chat_voice" && !conversationId?.trim()) {
+      throw MajikFileError.invalidInput(
+        'conversationId is required when context is "chat_voice"',
+      );
+    }
+
+    if (context === "chat_attachment" && !conversationId?.trim()) {
+      throw MajikFileError.invalidInput(
+        'conversationId is required when context is "chat_attachment"',
+      );
+    }
+
     if (chatMessageId && threadMessageId) {
       throw MajikFileError.invalidInput(
         "chatMessageId and threadMessageId are mutually exclusive",
@@ -1425,11 +1439,12 @@ export class MajikFile {
         "user_upload",
         "chat_attachment",
         "chat_image",
+        "chat_voice",
         "thread_attachment",
       ].includes(this._context)
     ) {
       errors.push(
-        "context must be user_upload | chat_attachment | thread_attachment",
+        "context must be user_upload | chat_attachment | chat_image | chat_voice | thread_attachment",
       );
     }
     if (this._chatMessageId && this._threadMessageId) {
@@ -1438,6 +1453,15 @@ export class MajikFile {
     if (this._context === "chat_image" && !this._conversationId?.trim()) {
       errors.push("conversation_id is required for chat_image context");
     }
+
+    if (this._context === "chat_voice" && !this._conversationId?.trim()) {
+      errors.push("conversation_id is required for chat_voice context");
+    }
+
+    if (this._context === "chat_attachment" && !this._conversationId?.trim()) {
+      errors.push("conversation_id is required for chat_attachment context");
+    }
+
     if (this._storageType === "temporary" && !this._expiresAt) {
       errors.push("expires_at is required for temporary files");
     }

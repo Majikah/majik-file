@@ -1,5 +1,7 @@
 # MJKB — Majik Binary Container Format
 
+[![Static Badge](https://img.shields.io/badge/IANA-vnd.majikah.bundle-green)](https://www.iana.org/assignments/media-types/application/vnd.majikah.bundle)
+
 **File Extension:** `.mjkb`  
 **Proposed Media Type:** `application/vnd.majikah.bundle`  
 **Category:** Secure binary container format  
