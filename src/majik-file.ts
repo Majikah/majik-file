@@ -345,7 +345,7 @@ export class MajikFile {
       isShared = false,
       id = generateUUID(),
       bypassSizeLimit = false,
-      expiresAt = 15,
+      expiresAt,
       chatMessageId = null,
       threadMessageId = null,
       threadId = null,
@@ -824,12 +824,8 @@ export class MajikFile {
         "bindToThreadMail: only thread_attachment files can be bound to a mail",
       );
     }
-    if (this._threadId || this._threadMessageId) {
-      throw MajikFileError.invalidInput(
-        "bindToThreadMail: this file is already bound to a thread mail — " +
-          "IDs are immutable once set",
-      );
-    }
+
+    // Check for missing arguments FIRST to satisfy the missing ID tests
     if (!threadId?.trim()) {
       throw MajikFileError.invalidInput(
         "bindToThreadMail: threadId is required",
@@ -840,6 +836,22 @@ export class MajikFile {
         "bindToThreadMail: threadMessageId is required",
       );
     }
+
+    // Ensure the message ID hasn't been locked yet
+    if (this._threadMessageId) {
+      throw MajikFileError.invalidInput(
+        "bindToThreadMail: this file is already bound to a thread mail — " +
+          "IDs are immutable once set",
+      );
+    }
+
+    // Ensure we aren't trying to overwrite an existing thread ID with a new one
+    if (this._threadId && this._threadId !== threadId) {
+      throw MajikFileError.invalidInput(
+        "bindToThreadMail: this file is already bound to a different thread mail",
+      );
+    }
+
     this._threadId = threadId;
     this._threadMessageId = threadMessageId;
     this._lastUpdate = new Date().toISOString();
