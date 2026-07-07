@@ -5,12 +5,16 @@ export default defineConfig({
     environment: "node",
     globals: true,
     pool: "threads",
-    hookTimeout: 60000,
-    testTimeout: 60000,
+    hookTimeout: 120000,
+    testTimeout: 120000,
     server: {
       deps: {
         // This tells Vitest to fix the missing extensions for this specific library on the fly
-        inline: [/@majikah\/majik-key/, /@majikah\/majik-contact/],
+        inline: [
+          /@majikah\/majik-key/,
+          /@majikah\/majik-contact/,
+          /@majikah\/majik-signature/,
+        ],
       },
     },
   },

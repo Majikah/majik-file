@@ -1984,20 +1984,22 @@ export class MajikFile {
   }
 
   /**
-   * Full binary verification — decrypts the loaded .mjkb binary and verifies
-   * the signature against the recovered plaintext bytes.
+   * Decrypt the loaded .mjkb binary (to confirm it is well-formed and the
+   * given identity can actually access it), then verify the attached
+   * signature against the encrypted binary — the same artifact that sign()
+   * signs and that verify() / verifySignedMJKB() check.
    *
-   * Use this when you want cryptographic proof that:
-   *   1. The ciphertext decrypts correctly (ML-KEM + AES-GCM authentication passes)
-   *   2. The decrypted plaintext matches what the signer originally signed
-   *
-   * This is the strongest verification path but requires both the identity
-   * (to decrypt) and the signer's public keys (to verify).
+   * This does NOT verify a hash of the plaintext specifically — the
+   * signature always covers ciphertext. Decryption here is a correctness
+   * gate (wrong key / corrupted file will throw), not a re-targeting of
+   * what gets verified. Use this when you want both "can this identity
+   * decrypt it" and "is the ciphertext unmodified" confirmed in one call.
    *
    * @param identity         ML-KEM identity for decryption.
    * @param keyOrPublicKeys  Signer's public keys for signature verification.
    * @returns VerificationResult with valid: true/false.
-   * @throws MajikFileError if binary is not loaded or no signature is attached.
+   * @throws MajikFileError if binary is not loaded, no signature is attached,
+   *         or decryption fails (wrong key / corrupted data).
    */
   async verifyBinary(
     identity: Pick<MajikFileIdentity, "fingerprint" | "mlKemSecretKey">,
@@ -2023,13 +2025,20 @@ export class MajikFile {
       );
     }
 
-    // Decrypt to recover plaintext bytes, then verify signature against them
-    const plaintext = await MajikFile.decrypt(this._binary, identity);
+    // Decrypting first proves the ciphertext is well-formed and the caller's
+    // identity actually has access — if this throws, the file is unusable
+    // regardless of signature validity, so let it propagate.
+    await MajikFile.decrypt(this._binary, identity);
 
+    // Signature verification targets the encrypted binary — mirrors verify()
+    // and verifySignedMJKB(), and matches what sign() actually signs. This is
+    // what lets verification work without requiring decryption in those two
+    // call sites; verifyBinary() additionally proves the ciphertext decrypts
+    // cleanly, but checks the same signed artifact as everywhere else.
     if (MajikFile._isMajikKey(keyOrPublicKeys)) {
-      return MajikSignature.verifyWithKey(plaintext, sig, keyOrPublicKeys);
+      return MajikSignature.verifyWithKey(this._binary, sig, keyOrPublicKeys);
     }
-    return MajikSignature.verify(plaintext, sig, keyOrPublicKeys);
+    return MajikSignature.verify(this._binary, sig, keyOrPublicKeys);
   }
 
   /**
