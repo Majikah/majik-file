@@ -1,4 +1,5 @@
 import { CompressionLevel } from "./compressor/majik-compressor";
+import type { MajikKey } from "@majikah/majik-key";
 
 export type MajikMessagePublicKey = string;
 
@@ -47,6 +48,19 @@ export interface MajikFileRecipient {
   /** ML-KEM-768 public key (1184 bytes). */
   mlKemPublicKey: Uint8Array;
 }
+
+/**
+ * Union accepted by every decrypt-related method on MajikFile (decrypt(),
+ * decryptWithMetadata(), decryptBinary(), decryptHydrate(), verifyBinary(),
+ * batchDecrypt()).
+ *
+ * Callers may pass either a full (unlocked) MajikKey instance, or the bare
+ * minimal identity shape — whichever is more convenient at the call site.
+ * MajikFile resolves either shape internally via a single private helper.
+ */
+export type MajikFileDecryptIdentity =
+  | MajikKey
+  | Pick<MajikFileIdentity, "fingerprint" | "mlKemSecretKey">;
 
 // ─── Per-recipient key entry (group .mjkb) ────────────────────────────────────
 

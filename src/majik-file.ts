@@ -3,7 +3,6 @@ import {
   aesGcmDecrypt,
   generateRandomBytes,
   mlKemEncapsulate,
-  mlKemDecapsulate,
   IV_LENGTH,
   AES_KEY_LEN,
 } from "./core/crypto/crypto-provider";
@@ -27,6 +26,10 @@ import {
   buildChatImageR2Key,
   encodeMjkb,
   decodeMjkb,
+  resolveAesKeyFromPayload,
+  contextRequiresConversationId,
+  shouldCompressForContext,
+  assertValidMlKemPublicKey,
   normaliseToUint8Array,
   normaliseToUint8ArrayAsync,
   isMimeTypeInlineViewable,
@@ -35,9 +38,7 @@ import {
   isExpired,
   buildExpiryDate,
   arrayToBase64,
-  base64ToUint8Array,
   convertImageToWebP,
-  shouldCompress,
   deduplicateRecipients,
   assertRecipientLimit,
 } from "./core/utils";
@@ -49,22 +50,22 @@ import type {
   MajikFileIdentity,
   MajikFileRecipient,
   MajikFileGroupKey,
-  MjkbSinglePayload,
-  MjkbGroupPayload,
+  MjkbPayload,
   MajikFileStats,
   FileContext,
   StorageType,
   TempFileDuration,
   MajikMessagePublicKey,
   FileSignature,
+  MajikFileDecryptIdentity,
 } from "./core/types";
-import { isMjkbGroupPayload, isMjkbSinglePayload } from "./core/types";
+import { isMjkbGroupPayload } from "./core/types";
 import {
   MajikSignature,
   type MajikSignerPublicKeys,
   type VerificationResult,
 } from "@majikah/majik-signature";
-import { MajikKey } from "@majikah/majik-key";
+import { MajikKey, MajikKeyError } from "@majikah/majik-key";
 
 /**
  * MajikFile
@@ -113,7 +114,26 @@ import { MajikKey } from "@majikah/majik-key";
  *   [4   payload JSON length (big-endian uint32)]
  *   [N   payload JSON — MjkbSinglePayload | MjkbGroupPayload]
  *   [M   AES-GCM ciphertext (Zstd-compressed file + 16-byte auth tag)]
+ *
+ * ─── Decrypt identity ─────────────────────────────────────────────────────────
+ *   Every decrypt-related method accepts a MajikFileDecryptIdentity: either a
+ *   full (unlocked) MajikKey instance, or the bare { fingerprint, mlKemSecretKey }
+ *   shape. Both are resolved and validated through the single private helper
+ *   MajikFile._resolveDecryptIdentity() — see that method for details.
  */
+
+// ── Batch / stats types ───────────────────────────────────────────────────
+
+export interface BatchDecryptResult {
+  success: boolean;
+  decrypted: MajikFile[];
+  errors: Array<{ invoiceId: string; reason: string }>;
+}
+
+export interface BatchLockResult {
+  locked: number;
+  skipped: number; // signed-only files
+}
 
 export class MajikFile {
   // ── Metadata ─────────────────────────────────────────────────────────────
@@ -148,6 +168,9 @@ export class MajikFile {
    * NOT serialised to JSON / Supabase — lives in R2 storage only.
    */
   private _binary: Uint8Array | null;
+
+  // ── Runtime-only decrypted cache (NOT persisted via toJSON) ───────────────
+  private _decrypted?: Uint8Array;
 
   // ── Private constructor ───────────────────────────────────────────────────
 
@@ -277,6 +300,15 @@ export class MajikFile {
     return !this._isGroup;
   }
 
+  get hasDecryptedFile(): boolean {
+    return this._decrypted !== undefined;
+  }
+
+  /** The cached decrypted file, if decryption has run this session. */
+  get decryptedFile(): Uint8Array | undefined {
+    return this._decrypted;
+  }
+
   // ── SIGNATURE ─────────────────────────────────────────────────────────────
 
   /**
@@ -362,14 +394,11 @@ export class MajikFile {
       throw MajikFileError.invalidInput("userId is required");
     if (!identity.fingerprint?.trim())
       throw MajikFileError.invalidInput("identity.fingerprint is required");
-    if (
-      !(identity.mlKemPublicKey instanceof Uint8Array) ||
-      identity.mlKemPublicKey.length !== ML_KEM_PK_LEN
-    ) {
-      throw MajikFileError.invalidInput(
-        `identity.mlKemPublicKey must be a ${ML_KEM_PK_LEN}-byte Uint8Array`,
-      );
-    }
+    assertValidMlKemPublicKey(
+      identity.mlKemPublicKey,
+      "identity.mlKemPublicKey",
+    );
+
     if (
       ![
         "user_upload",
@@ -381,24 +410,11 @@ export class MajikFile {
     ) {
       throw MajikFileError.invalidInput(`Invalid context: "${context}"`);
     }
-    if (context === "chat_image" && !conversationId?.trim()) {
+    if (contextRequiresConversationId(context) && !conversationId?.trim()) {
       throw MajikFileError.invalidInput(
-        'conversationId is required when context is "chat_image"',
+        `conversationId is required when context is "${context}"`,
       );
     }
-
-    if (context === "chat_voice" && !conversationId?.trim()) {
-      throw MajikFileError.invalidInput(
-        'conversationId is required when context is "chat_voice"',
-      );
-    }
-
-    if (context === "chat_attachment" && !conversationId?.trim()) {
-      throw MajikFileError.invalidInput(
-        'conversationId is required when context is "chat_attachment"',
-      );
-    }
-
     if (chatMessageId && threadMessageId) {
       throw MajikFileError.invalidInput(
         "chatMessageId and threadMessageId are mutually exclusive",
@@ -418,14 +434,10 @@ export class MajikFile {
           `recipients[${i}].fingerprint is required`,
         );
       }
-      if (
-        !(r.mlKemPublicKey instanceof Uint8Array) ||
-        r.mlKemPublicKey.length !== ML_KEM_PK_LEN
-      ) {
-        throw MajikFileError.invalidInput(
-          `recipients[${i}].mlKemPublicKey must be a ${ML_KEM_PK_LEN}-byte Uint8Array`,
-        );
-      }
+      assertValidMlKemPublicKey(
+        r.mlKemPublicKey,
+        `recipients[${i}].mlKemPublicKey`,
+      );
     }
 
     const raw = normaliseToUint8Array(data);
@@ -468,15 +480,9 @@ export class MajikFile {
       }
 
       // ── 3. Compress (compressible formats only) ───────────────────────
-      // shouldCompress() returns false for JPEG/WebP/AVIF/video/audio/archives.
-      // After the WebP conversion step above, chat images will typically be
-      // WebP and therefore skipped here — WebP is already codec-compressed.
-      // For user_upload and thread_attachment, compressible images (PNG, BMP,
-      // TIFF, SVG, etc.) are Zstd-compressed at level 22.
-      const compressible =
-        context === "user_upload" || context === "thread_attachment"
-          ? true
-          : shouldCompress(resolvedMimeType);
+      // Delegates to shouldCompressForContext() — the same context-aware
+      // policy the decrypt path checks, so the two can never drift apart.
+      const compressible = shouldCompressForContext(context, resolvedMimeType);
       const compressed = compressible
         ? await MajikCompressor.compress(processedBytes, compressionLevel)
         : processedBytes;
@@ -514,7 +520,7 @@ export class MajikFile {
       const isGroupFile = cleanedRecipients.length > 0;
 
       let ciphertext: Uint8Array;
-      let payload: MjkbSinglePayload | MjkbGroupPayload;
+      let payload: MjkbPayload;
 
       if (!isGroupFile) {
         // ── Single ───────────────────────────────────────────────────────
@@ -528,7 +534,7 @@ export class MajikFile {
           n: originalName ?? null,
           m: resolvedMimeType ?? null,
           c: context ?? null,
-        } satisfies MjkbSinglePayload;
+        };
       } else {
         // ── Group ─────────────────────────────────────────────────────────
         // Random group AES key encrypts the file once
@@ -556,7 +562,7 @@ export class MajikFile {
           n: originalName ?? null,
           m: resolvedMimeType ?? null,
           c: context ?? null,
-        } satisfies MjkbGroupPayload;
+        };
       }
 
       // ── 6. Encode .mjkb ───────────────────────────────────────────────
@@ -889,83 +895,93 @@ export class MajikFile {
     this._lastUpdate = new Date().toISOString();
   }
 
-  // ── DECRYPT (static) ──────────────────────────────────────────────────────
+  // ── IDENTITY RESOLUTION (decrypt-related methods) ─────────────────────────
 
   /**
-   * Decrypt a .mjkb Blob, Uint8Array, or ArrayBuffer.
-   *
-   * Single:
-   *   Decapsulate → sharedSecret → AES-256-GCM key → decompress → raw bytes.
-   *
-   * Group:
-   *   Find key entry by `identity.fingerprint` → decapsulate → XOR to recover
-   *   group AES key → AES-256-GCM decrypt → decompress → raw bytes.
-   *
-   * Note: ML-KEM decapsulation NEVER throws on a wrong key — it returns a garbage
-   * shared secret. AES-GCM authentication catches this silently (returns null).
-   *
-   * @throws MajikFileError on wrong key, missing key entry, corrupt data, or format errors.
+   * Duck/type-narrowing check used to distinguish a MajikKey instance from
+   * every other accepted shape (a bare identity object for decryption, or
+   * MajikSignerPublicKeys for signature verification). Single canonical
+   * check reused everywhere that discrimination is needed.
    */
-  static async decrypt(
-    source: Blob | Uint8Array | ArrayBuffer,
-    identity: Pick<MajikFileIdentity, "fingerprint" | "mlKemSecretKey">,
-  ): Promise<Uint8Array> {
-    if (!identity)
+  private static _isMajikKey<T>(v: MajikKey | T): v is MajikKey {
+    return v instanceof MajikKey;
+  }
+
+  /**
+   * Resolve any accepted decrypt-identity shape down to the minimal
+   * { fingerprint, mlKemSecretKey } pair, validating along the way.
+   *
+   * This is the single entry point every decrypt-related method funnels
+   * through — decrypt(), decryptWithMetadata(), decryptBinary(),
+   * decryptHydrate(), verifyBinary(), and batchDecrypt() all accept either
+   * a full (unlocked) MajikKey instance or a bare MajikFileIdentity-shaped
+   * object interchangeably.
+   *
+   * @throws MajikFileError if identity is missing or the ML-KEM secret key
+   *         is the wrong length.
+   * @throws MajikKeyError if a MajikKey input is locked or has no ML-KEM
+   *         secret key loaded.
+   */
+  private static _resolveDecryptIdentity(
+    input: MajikFileDecryptIdentity,
+  ): Pick<MajikFileIdentity, "fingerprint" | "mlKemSecretKey"> {
+    if (!input) {
       throw MajikFileError.invalidInput("identity is required for decryption");
+    }
+
+    let fingerprint: string;
+    let mlKemSecretKey: Uint8Array | undefined;
+
+    if (MajikFile._isMajikKey(input)) {
+      if (input.isLocked || !input.mlKemSecretKey) {
+        throw new MajikKeyError("Key is locked", "MajikKey");
+      }
+      fingerprint = input.fingerprint;
+      mlKemSecretKey = input.mlKemSecretKey;
+    } else {
+      fingerprint = input.fingerprint;
+      mlKemSecretKey = input.mlKemSecretKey;
+    }
+
     if (
-      !(identity.mlKemSecretKey instanceof Uint8Array) ||
-      identity.mlKemSecretKey.length !== ML_KEM_SK_LEN
+      !(mlKemSecretKey instanceof Uint8Array) ||
+      mlKemSecretKey.length !== ML_KEM_SK_LEN
     ) {
       throw MajikFileError.invalidInput(
         `identity.mlKemSecretKey must be ${ML_KEM_SK_LEN} bytes (got ${
-          (identity.mlKemSecretKey as any)?.length ?? "undefined"
+          mlKemSecretKey?.length ?? "undefined"
         })`,
       );
     }
 
+    return { fingerprint, mlKemSecretKey };
+  }
+
+  // ── DECRYPT (static) ──────────────────────────────────────────────────────
+
+  /**
+   * Core decrypt routine shared by decrypt() and decryptWithMetadata().
+   * Decodes the .mjkb binary, recovers the AES key (single or group path via
+   * resolveAesKeyFromPayload), authenticates + decrypts, and decompresses
+   * using the same context-aware policy applied at encrypt time.
+   *
+   * Note: ML-KEM decapsulation NEVER throws on a wrong key — it returns a
+   * garbage shared secret. AES-GCM authentication catches this silently
+   * (aesGcmDecrypt returns null), which we surface as decryptionFailed().
+   */
+  private static async _decryptCore(
+    source: Blob | Uint8Array | ArrayBuffer,
+    identity: MajikFileDecryptIdentity,
+  ): Promise<{ bytes: Uint8Array; payload: MjkbPayload }> {
+    const resolved = MajikFile._resolveDecryptIdentity(identity);
+
     try {
-      const raw = this.stripMjksTrailer(
+      const raw = MajikFile.stripMjksTrailer(
         await normaliseToUint8ArrayAsync(source),
       );
-
       const { iv, payload, ciphertext } = decodeMjkb(raw);
 
-      let aesKey: Uint8Array;
-
-      if (isMjkbSinglePayload(payload)) {
-        // ── Single ─────────────────────────────────────────────────────
-        const mlKemCT = base64ToUint8Array(payload.mlKemCipherText);
-        aesKey = mlKemDecapsulate(mlKemCT, identity.mlKemSecretKey);
-      } else if (isMjkbGroupPayload(payload)) {
-        // ── Group ──────────────────────────────────────────────────────
-        if (!identity.fingerprint?.trim()) {
-          throw MajikFileError.invalidInput(
-            "identity.fingerprint is required to decrypt group files",
-          );
-        }
-        const entry = payload.keys.find(
-          (k) => k.fingerprint === identity.fingerprint,
-        );
-        if (!entry) {
-          throw MajikFileError.decryptionFailed(
-            `No key entry found for fingerprint "${identity.fingerprint}" — this identity does not have access to this file`,
-          );
-        }
-        const mlKemCT = base64ToUint8Array(entry.mlKemCipherText);
-        const sharedSecret = mlKemDecapsulate(mlKemCT, identity.mlKemSecretKey);
-        const encAesKey = base64ToUint8Array(entry.encryptedAesKey);
-
-        // Recover group AES key: aesKey = encryptedAesKey XOR sharedSecret
-        aesKey = new Uint8Array(AES_KEY_LEN);
-        for (let i = 0; i < AES_KEY_LEN; i++) {
-          aesKey[i] = encAesKey[i] ^ sharedSecret[i];
-        }
-      } else {
-        throw MajikFileError.formatError(
-          ".mjkb payload JSON is neither a single nor group payload",
-        );
-      }
-
+      const aesKey = resolveAesKeyFromPayload(payload, resolved);
       const decrypted = aesGcmDecrypt(aesKey, iv, ciphertext);
       if (!decrypted) {
         throw MajikFileError.decryptionFailed(
@@ -973,19 +989,32 @@ export class MajikFile {
         );
       }
 
-      const compressible =
-        payload.c === "user_upload" || payload.c === "thread_attachment"
-          ? true
-          : shouldCompress(payload.m);
-      const returnData = compressible
+      const bytes = shouldCompressForContext(payload.c, payload.m)
         ? await MajikCompressor.decompress(decrypted)
         : decrypted;
 
-      return returnData;
+      return { bytes, payload };
     } catch (err) {
       if (err instanceof MajikFileError) throw err;
       throw MajikFileError.decryptionFailed("File decryption failed", err);
     }
+  }
+
+  /**
+   * Decrypt a .mjkb Blob, Uint8Array, or ArrayBuffer.
+   *
+   * Accepts either a full (unlocked) MajikKey instance or a bare
+   * { fingerprint, mlKemSecretKey } identity — see _resolveDecryptIdentity().
+   *
+   * @throws MajikFileError on wrong key, missing key entry, corrupt data, or format errors.
+   * @throws MajikKeyError if a MajikKey input is locked.
+   */
+  static async decrypt(
+    source: Blob | Uint8Array | ArrayBuffer,
+    identity: MajikFileDecryptIdentity,
+  ): Promise<Uint8Array> {
+    const { bytes } = await MajikFile._decryptCore(source, identity);
+    return bytes;
   }
 
   /**
@@ -1010,7 +1039,7 @@ export class MajikFile {
    */
   static async decryptWithMetadata(
     source: Blob | Uint8Array | ArrayBuffer,
-    identity: Pick<MajikFileIdentity, "fingerprint" | "mlKemSecretKey">,
+    identity: MajikFileDecryptIdentity,
     signatureRaw?: string | null,
   ): Promise<{
     bytes: Uint8Array;
@@ -1018,97 +1047,22 @@ export class MajikFile {
     mimeType: string | null;
     signature: MajikSignature | null;
   }> {
-    if (!identity)
-      throw MajikFileError.invalidInput("identity is required for decryption");
-    if (
-      !(identity.mlKemSecretKey instanceof Uint8Array) ||
-      identity.mlKemSecretKey.length !== ML_KEM_SK_LEN
-    ) {
-      throw MajikFileError.invalidInput(
-        `identity.mlKemSecretKey must be ${ML_KEM_SK_LEN} bytes (got ${
-          (identity.mlKemSecretKey as any)?.length ?? "undefined"
-        })`,
-      );
+    const { bytes, payload } = await MajikFile._decryptCore(source, identity);
+
+    // Deserialize if a raw signature string was provided. Malformed values
+    // are silently swallowed — the caller receives null and can decide
+    // whether to treat that as an error based on their own policy.
+    let signature: MajikSignature | null = null;
+    if (signatureRaw?.trim()) {
+      try {
+        signature = MajikSignature.deserialize(signatureRaw);
+      } catch {
+        signature = null;
+      }
     }
 
-    try {
-      const raw = this.stripMjksTrailer(
-        await normaliseToUint8ArrayAsync(source),
-      );
-      const { iv, payload, ciphertext } = decodeMjkb(raw);
-
-      let aesKey: Uint8Array;
-
-      if (isMjkbSinglePayload(payload)) {
-        const mlKemCT = base64ToUint8Array(payload.mlKemCipherText);
-        aesKey = mlKemDecapsulate(mlKemCT, identity.mlKemSecretKey);
-      } else if (isMjkbGroupPayload(payload)) {
-        if (!identity.fingerprint?.trim()) {
-          throw MajikFileError.invalidInput(
-            "identity.fingerprint is required to decrypt group files",
-          );
-        }
-        const entry = payload.keys.find(
-          (k) => k.fingerprint === identity.fingerprint,
-        );
-        if (!entry) {
-          throw MajikFileError.decryptionFailed(
-            `No key entry found for fingerprint "${identity.fingerprint}"`,
-          );
-        }
-        const mlKemCT = base64ToUint8Array(entry.mlKemCipherText);
-        const sharedSecret = mlKemDecapsulate(mlKemCT, identity.mlKemSecretKey);
-        const encAesKey = base64ToUint8Array(entry.encryptedAesKey);
-        aesKey = new Uint8Array(AES_KEY_LEN);
-        for (let i = 0; i < AES_KEY_LEN; i++) {
-          aesKey[i] = encAesKey[i] ^ sharedSecret[i];
-        }
-      } else {
-        throw MajikFileError.formatError(
-          ".mjkb payload JSON is neither a single nor group payload",
-        );
-      }
-
-      const decrypted = aesGcmDecrypt(aesKey, iv, ciphertext);
-      if (!decrypted) {
-        throw MajikFileError.decryptionFailed(
-          "Decryption failed — wrong key or corrupted .mjkb file",
-        );
-      }
-
-      const compressible =
-        payload.c === "user_upload" || payload.c === "thread_attachment"
-          ? true
-          : shouldCompress(payload.m);
-      const bytes = compressible
-        ? await MajikCompressor.decompress(decrypted)
-        : decrypted;
-
-      const originalName = payload.n;
-      const mimeType = payload.m;
-
-      // ── Signature ─────────────────────────────────────────────────────────
-      // Deserialize if a raw signature string was provided. Malformed values
-      // are silently swallowed — the caller receives null and can decide
-      // whether to treat that as an error based on their own policy.
-      let signature: MajikSignature | null = null;
-      if (signatureRaw?.trim()) {
-        try {
-          signature = MajikSignature.deserialize(signatureRaw);
-        } catch {
-          signature = null;
-        }
-      }
-
-      return { bytes, originalName, mimeType, signature };
-    } catch (err) {
-      if (err instanceof MajikFileError) throw err;
-      throw MajikFileError.decryptionFailed("File decryption failed", err);
-    }
+    return { bytes, originalName: payload.n, mimeType: payload.m, signature };
   }
-
-  // Fix 1 — instance wrapper for decryptWithMetadata
-  // Add alongside decryptBinary() in the DECRYPT section
 
   /**
    * Instance wrapper around MajikFile.decryptWithMetadata() that automatically
@@ -1117,9 +1071,7 @@ export class MajikFile {
    *
    * @throws MajikFileError if _binary is not loaded or decryption fails.
    */
-  async decryptWithMetadata(
-    identity: Pick<MajikFileIdentity, "fingerprint" | "mlKemSecretKey">,
-  ): Promise<{
+  async decryptWithMetadata(identity: MajikFileDecryptIdentity): Promise<{
     bytes: Uint8Array;
     originalName: string | null;
     mimeType: string | null;
@@ -1139,11 +1091,128 @@ export class MajikFile {
    *
    * @throws MajikFileError if _binary is not loaded or decryption fails.
    */
-  async decryptBinary(
-    identity: Pick<MajikFileIdentity, "fingerprint" | "mlKemSecretKey">,
-  ): Promise<Uint8Array> {
+  async decryptBinary(identity: MajikFileDecryptIdentity): Promise<Uint8Array> {
     if (!this._binary) throw MajikFileError.missingBinary();
     return MajikFile.decrypt(this._binary, identity);
+  }
+
+  /**
+   * Decrypt the loaded binary and cache the plaintext on `_decrypted`.
+   * Returns `this` for chaining. The cache is runtime-only — it is never
+   * included in toJSON(); use toDangerousJSON() if you explicitly need to
+   * serialise it.
+   */
+  async decryptHydrate(identity: MajikFileDecryptIdentity): Promise<MajikFile> {
+    if (!this._binary) throw MajikFileError.missingBinary();
+    const { bytes } = await MajikFile._decryptCore(this._binary, identity);
+    this._decrypted = bytes;
+    return this;
+  }
+
+  /**
+   * Check whether a given MajikKey can decrypt this file.
+   *
+   * For single-recipient envelopes: checks if the key's fingerprint matches.
+   * For group envelopes: checks if the fingerprint is in the recipient list.
+   * Does not attempt actual decryption — fingerprint check only.
+   */
+  canDecrypt(key: MajikKey | Pick<MajikFileIdentity, "fingerprint">): boolean {
+    return this._participants.includes(key.fingerprint);
+  }
+
+  // ==========================================================================
+  // ── Batch Operations ──────────────────────────────────────────────────────────
+  // ==========================================================================
+
+  /**
+   * Decrypt an array of MajikFile instances concurrently.
+   * Signed-only files are passed through unchanged (they need no decryption).
+   * Encrypted files that cannot be decrypted with the provided key are
+   * collected in the errors array and excluded from `decrypted`.
+   *
+   * @param files  - Array of MajikFile to process
+   * @param key       - An unlocked MajikKey authorised to decrypt the files
+   * @returns BatchDecryptResult
+   */
+  static async batchDecrypt(
+    files: MajikFile[],
+    key: MajikKey,
+  ): Promise<BatchDecryptResult> {
+    // Resolve + validate once up front — fails fast before touching any file,
+    // and reuses the same locked-key / missing-secret-key check as every
+    // other decrypt-related method.
+    MajikFile._resolveDecryptIdentity(key);
+
+    const errors: BatchDecryptResult["errors"] = [];
+
+    const results = await Promise.allSettled(
+      files.map(async (file) => {
+        if (file.hasDecryptedFile) return file;
+        if (!file.canDecrypt(key)) {
+          throw new Error(
+            `Key "${key.fingerprint}" is not a participant of this file.`,
+          );
+        }
+        return file.decryptHydrate(key);
+      }),
+    );
+
+    const decrypted: MajikFile[] = [];
+
+    results.forEach((result, i) => {
+      if (result.status === "fulfilled") {
+        decrypted.push(result.value);
+      } else {
+        errors.push({
+          invoiceId: files[i].id,
+          reason:
+            result.reason instanceof Error
+              ? result.reason.message
+              : String(result.reason),
+        });
+      }
+    });
+
+    return {
+      success: errors.length === 0,
+      decrypted,
+      errors,
+    };
+  }
+
+  /**
+   * Clears the in-memory decrypted cache from all encrypted files.
+   * Signed-only files are skipped (nothing to lock).
+   *
+   * Call this after you're done with a batch to minimise plaintext in memory.
+   *
+   * @param files - Array of MajikFile to lock
+   * @returns BatchLockResult with counts of locked vs skipped
+   */
+  static batchLock(files: MajikFile[]): BatchLockResult {
+    let locked = 0;
+    let skipped = 0;
+
+    for (const file of files) {
+      if (!file.hasDecryptedFile) {
+        skipped++;
+        continue;
+      }
+      file.secureLock();
+      locked++;
+    }
+
+    return { locked, skipped };
+  }
+
+  /**
+   * Securely clears runtime-sensitive decrypted state from memory.
+   *
+   * - Only affects in-memory cache
+   */
+  secureLock(): this {
+    this._decrypted = undefined;
+    return this;
   }
 
   // ── STORAGE TYPE MUTATION ─────────────────────────────────────────────────
@@ -1216,7 +1285,9 @@ export class MajikFile {
 
   /**
    * Serialise metadata to a plain object matching the `majik_files` Supabase table.
-   * The encrypted binary (_binary) is intentionally excluded.
+   * The encrypted binary (_binary) AND the in-memory decrypted cache
+   * (_decrypted) are intentionally excluded. Use toDangerousJSON() if you
+   * explicitly need the decrypted plaintext included.
    */
   toJSON(): MajikFileJSON {
     this.validate();
@@ -1243,6 +1314,24 @@ export class MajikFile {
       timestamp: this._timestamp,
       last_update: this._lastUpdate,
       signature: this._signature ?? null,
+    };
+  }
+
+  /**
+   * Like toJSON(), but also includes the in-memory decrypted plaintext
+   * (base64-encoded) if decryptHydrate() has populated it this session.
+   * `decrypted_base64` is null if nothing has been decrypted yet.
+   *
+   * ⚠️ DANGEROUS: this exposes plaintext file contents in the serialised
+   * output. Never persist the result to Supabase or any shared/long-lived
+   * store — this exists only for call sites that explicitly need the
+   * decrypted bytes alongside the metadata (e.g. short-lived local caching)
+   * and are prepared to handle that plaintext responsibly.
+   */
+  toDangerousJSON(): MajikFileJSON & { decrypted_base64: string | null } {
+    return {
+      ...this.toJSON(),
+      decrypted_base64: this._decrypted ? arrayToBase64(this._decrypted) : null,
     };
   }
 
@@ -1306,7 +1395,7 @@ export class MajikFile {
   toMJKB(): Blob {
     if (!this._binary) throw MajikFileError.missingBinary();
     return new Blob([this._binary as BlobPart], {
-      type: "application/octet-stream",
+      type: "application/vnd.majikah.bundle",
     });
   }
 
@@ -1402,7 +1491,7 @@ export class MajikFile {
     trailer.set(MJKS_MAGIC, len + 4);
 
     return new Blob([this._binary as BlobPart, trailer], {
-      type: "application/octet-stream",
+      type: "application/vnd.majikah.bundle",
     });
   }
 
@@ -1462,18 +1551,12 @@ export class MajikFile {
     if (this._chatMessageId && this._threadMessageId) {
       errors.push("chat_message_id and thread_message_id cannot both be set");
     }
-    if (this._context === "chat_image" && !this._conversationId?.trim()) {
-      errors.push("conversation_id is required for chat_image context");
+    if (
+      contextRequiresConversationId(this._context) &&
+      !this._conversationId?.trim()
+    ) {
+      errors.push(`conversation_id is required for ${this._context} context`);
     }
-
-    if (this._context === "chat_voice" && !this._conversationId?.trim()) {
-      errors.push("conversation_id is required for chat_voice context");
-    }
-
-    if (this._context === "chat_attachment" && !this._conversationId?.trim()) {
-      errors.push("conversation_id is required for chat_attachment context");
-    }
-
     if (this._storageType === "temporary" && !this._expiresAt) {
       errors.push("expires_at is required for temporary files");
     }
@@ -1995,14 +2078,15 @@ export class MajikFile {
    * what gets verified. Use this when you want both "can this identity
    * decrypt it" and "is the ciphertext unmodified" confirmed in one call.
    *
-   * @param identity         ML-KEM identity for decryption.
+   * @param identity         Decrypt identity — MajikKey instance or bare
+   *                         { fingerprint, mlKemSecretKey }, see decrypt().
    * @param keyOrPublicKeys  Signer's public keys for signature verification.
    * @returns VerificationResult with valid: true/false.
    * @throws MajikFileError if binary is not loaded, no signature is attached,
    *         or decryption fails (wrong key / corrupted data).
    */
   async verifyBinary(
-    identity: Pick<MajikFileIdentity, "fingerprint" | "mlKemSecretKey">,
+    identity: MajikFileDecryptIdentity,
     keyOrPublicKeys: MajikKey | MajikSignerPublicKeys,
   ): Promise<VerificationResult> {
     if (!this._binary) {
@@ -2112,21 +2196,5 @@ export class MajikFile {
     } catch {
       return null;
     }
-  }
-
-  // ── Private signature helpers ─────────────────────────────────────────────
-
-  /**
-   * Duck-type check to distinguish MajikKey from MajikSignerPublicKeys.
-   * Mirrors the same helper in MajikSignature — kept private here to avoid
-   * exposing key-type discrimination on the public API.
-   */
-  private static _isMajikKey(
-    v: MajikKey | MajikSignerPublicKeys,
-  ): v is MajikKey {
-    // MajikKey carries `fingerprint`; MajikSignerPublicKeys uses `signerId`.
-    // This distinction is what makes the duck-type safe — if MajikSignerPublicKeys
-    // ever gains a `fingerprint` field this check must be updated.
-    return typeof (v as MajikKey).fingerprint === "string";
   }
 }

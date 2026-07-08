@@ -6,14 +6,16 @@
  *  - SHA-256 hashing (synchronous via @stablelib/sha256)
  *  - UUID generation
  *  - .mjkb binary encode / decode  ← updated format supporting single & group
+ *  - AES key recovery from a decoded .mjkb payload (single & group)
  *  - R2 key construction
- *  - MIME type helpers
+ *  - MIME / context / compression policy helpers
  *  - Human-readable file size formatting
  *  - Expiry helpers
  */
 
 import { hash } from "@stablelib/sha256";
 import { MajikFileError } from "./error";
+import { mlKemDecapsulate, AES_KEY_LEN } from "./crypto/crypto-provider";
 import {
   MJKB_MAGIC,
   MJKB_VERSION,
@@ -23,12 +25,17 @@ import {
   MAX_RECIPIENTS,
   INCOMPRESSIBLE_MIME_TYPES,
   WEBP_CONVERTIBLE_IMAGE_TYPES,
+  ML_KEM_PK_LEN,
 } from "./crypto/constants";
-import type {
-  DecodedMjkb,
-  MajikFileRecipient,
-  MjkbPayload,
-  TempFileDuration,
+import {
+  isMjkbGroupPayload,
+  isMjkbSinglePayload,
+  type DecodedMjkb,
+  type FileContext,
+  type MajikFileIdentity,
+  type MajikFileRecipient,
+  type MjkbPayload,
+  type TempFileDuration,
 } from "./types";
 
 // ─── Base64 ───────────────────────────────────────────────────────────────────
@@ -343,6 +350,81 @@ export function decodeMjkb(raw: Uint8Array): DecodedMjkb {
   return { version, iv, payload, ciphertext };
 }
 
+// ─── AES Key Recovery (decrypt path) ──────────────────────────────────────────
+
+/**
+ * Recover the AES-256-GCM key for a decoded .mjkb payload.
+ *
+ * Single payload: ML-KEM decapsulate → shared secret used directly as the key.
+ * Group payload:  Locate the caller's key entry by fingerprint → decapsulate
+ *                 → XOR-unwrap the group AES key.
+ *
+ * This is the single source of truth for the single-vs-group key recovery
+ * branch — every decrypt call site (MajikFile.decrypt, decryptWithMetadata)
+ * funnels through here so the two paths cannot drift apart.
+ *
+ * @throws MajikFileError if the payload is a group payload and no fingerprint
+ *         is supplied, no matching key entry is found, or the payload shape
+ *         is unrecognised.
+ */
+export function resolveAesKeyFromPayload(
+  payload: MjkbPayload,
+  identity: Pick<MajikFileIdentity, "fingerprint" | "mlKemSecretKey">,
+): Uint8Array {
+  if (isMjkbSinglePayload(payload)) {
+    const mlKemCT = base64ToUint8Array(payload.mlKemCipherText);
+    return mlKemDecapsulate(mlKemCT, identity.mlKemSecretKey);
+  }
+
+  if (isMjkbGroupPayload(payload)) {
+    if (!identity.fingerprint?.trim()) {
+      throw MajikFileError.invalidInput(
+        "identity.fingerprint is required to decrypt group files",
+      );
+    }
+    const entry = payload.keys.find(
+      (k) => k.fingerprint === identity.fingerprint,
+    );
+    if (!entry) {
+      throw MajikFileError.decryptionFailed(
+        `No key entry found for fingerprint "${identity.fingerprint}" — this identity does not have access to this file`,
+      );
+    }
+    const mlKemCT = base64ToUint8Array(entry.mlKemCipherText);
+    const sharedSecret = mlKemDecapsulate(mlKemCT, identity.mlKemSecretKey);
+    const encAesKey = base64ToUint8Array(entry.encryptedAesKey);
+
+    const aesKey = new Uint8Array(AES_KEY_LEN);
+    for (let i = 0; i < AES_KEY_LEN; i++) {
+      aesKey[i] = encAesKey[i] ^ sharedSecret[i];
+    }
+    return aesKey;
+  }
+
+  throw MajikFileError.formatError(
+    ".mjkb payload JSON is neither a single nor group payload",
+  );
+}
+
+// ─── Context / Conversation Requirements ──────────────────────────────────────
+
+/**
+ * Contexts that require a conversationId to be set — enforced identically at
+ * create() time and on every subsequent validate() call. Single source of
+ * truth for what was previously three duplicated if-blocks.
+ */
+const CONTEXTS_REQUIRING_CONVERSATION_ID = new Set<FileContext>([
+  "chat_image",
+  "chat_voice",
+  "chat_attachment",
+]);
+
+export function contextRequiresConversationId(
+  context: FileContext | null,
+): boolean {
+  return context !== null && CONTEXTS_REQUIRING_CONVERSATION_ID.has(context);
+}
+
 // ─── Expiry Helpers ───────────────────────────────────────────────────────────
 
 /** Returns true if the given ISO-8601 timestamp is in the past. */
@@ -410,6 +492,24 @@ export function assertRecipientLimit(recipients: MajikFileRecipient[]): void {
 }
 
 /**
+ * Assert that a value is a well-formed ML-KEM-768 public key.
+ * Shared by CreateOptions.identity and every entry in CreateOptions.recipients.
+ *
+ * @param label  Field path used in the error message, e.g. "identity.mlKemPublicKey"
+ *               or "recipients[2].mlKemPublicKey".
+ */
+export function assertValidMlKemPublicKey(
+  key: unknown,
+  label: string,
+): asserts key is Uint8Array {
+  if (!(key instanceof Uint8Array) || key.length !== ML_KEM_PK_LEN) {
+    throw MajikFileError.invalidInput(
+      `${label} must be a ${ML_KEM_PK_LEN}-byte Uint8Array`,
+    );
+  }
+}
+
+/**
  * Decide whether raw bytes should be Zstd-compressed before encryption.
  *
  * Returns false for MIME types that are already compressed at the codec level
@@ -424,6 +524,29 @@ export function shouldCompress(mimeType: string | null): boolean {
   if (!mimeType) return true;
   const normalised = mimeType.toLowerCase().split(";")[0].trim();
   return !INCOMPRESSIBLE_MIME_TYPES.has(normalised);
+}
+
+/**
+ * Context-aware compression policy — the single source of truth used both at
+ * encrypt time (MajikFile.create) and decrypt time (MajikFile.decrypt /
+ * decryptWithMetadata). These two call sites MUST always agree, or files
+ * become undecodable, so both now delegate here instead of maintaining two
+ * copies of the same ternary.
+ *
+ * user_upload and thread_attachment are always compressed regardless of MIME
+ * type; every other context falls back to the MIME-based shouldCompress().
+ */
+const ALWAYS_COMPRESSED_CONTEXTS = new Set<FileContext>([
+  "user_upload",
+  "thread_attachment",
+]);
+
+export function shouldCompressForContext(
+  context: FileContext | null,
+  mimeType: string | null,
+): boolean {
+  if (context && ALWAYS_COMPRESSED_CONTEXTS.has(context)) return true;
+  return shouldCompress(mimeType);
 }
 
 /**
