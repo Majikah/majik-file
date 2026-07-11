@@ -21,6 +21,6 @@ jobs:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
-      - run: npm ci
+      - run: npm ci --legacy-peer-deps
       - run: npm test --if-present
       - run: npm publish
