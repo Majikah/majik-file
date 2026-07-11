@@ -65,16 +65,16 @@
     "ed2curve": "^0.3.0"
   },
   "devDependencies": {
-    "@majikah/majik-key": "^0.2.14",
-    "@majikah/majik-signature": "^0.0.31",
+    "@majikah/majik-key": "^0.3.0",
+    "@majikah/majik-signature": "^0.1.0",
     "@types/ed2curve": "^0.2.4",
     "@types/node": "^26.1.1",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
   },
   "peerDependencies": {
-    "@majikah/majik-key": "^0.2.14",
-    "@majikah/majik-signature": "^0.0.31"
+    "@majikah/majik-key": "^0.3.0",
+    "@majikah/majik-signature": "^0.1.0"
   },
   "peerDependenciesMeta": {
     "@majikah/majik-key": {
