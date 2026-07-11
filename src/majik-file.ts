@@ -1113,7 +1113,7 @@ export class MajikFile {
    * Check whether a given MajikKey can decrypt this file.
    *
    * For single-recipient envelopes: checks if the key's fingerprint matches.
-   * For group envelopes: checks if the fingerprint is in the recipient list.
+   * For group envelopes: checks if the fingerprint is in the participants list.
    * Does not attempt actual decryption — fingerprint check only.
    */
   canDecrypt(key: MajikKey | Pick<MajikFileIdentity, "fingerprint">): boolean {
