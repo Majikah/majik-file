@@ -10,7 +10,10 @@ export type MajikFileErrorCode =
   | "FORMAT_ERROR"
   | "SIZE_EXCEEDED"
   | "MISSING_BINARY"
-  | "UNSUPPORTED_VERSION";
+  | "UNSUPPORTED_VERSION"
+  | "UNSUPPORTED_SCHEMA_VERSION"
+  | "LEGACY_MIGRATION_FAILED"
+  | "STORAGE_KEY_MISMATCH";
 
 export class MajikFileError extends Error {
   readonly code: MajikFileErrorCode;
@@ -93,7 +96,42 @@ export class MajikFileError extends Error {
   ): MajikFileError {
     return new MajikFileError(
       "UNSUPPORTED_VERSION",
-      `Unsupported .mjkb version: ${version}. Only v${supported} is supported.`,
+      `Unsupported .mjkb binary version: ${version}. ` +
+        `Only v${supported} (plus documented legacy versions) is supported.`,
     );
+  }
+
+  /**
+   * JSON/record schema version is unsupported — distinct from
+   * unsupportedVersion(), which is about the .mjkb *binary* layout.
+   */
+  static unsupportedSchemaVersion(
+    version: number,
+    supportedMax: number,
+  ): MajikFileError {
+    return new MajikFileError(
+      "UNSUPPORTED_SCHEMA_VERSION",
+      `Unsupported MajikFile record schema version: ${version}. ` +
+        `This SDK supports up to schema v${supportedMax}. ` +
+        `Upgrade the SDK, or this may be a legacy record — try fromLegacyJSON().`,
+    );
+  }
+
+  /** Thrown when an automatic or explicit legacy → current migration fails. */
+  static legacyMigrationFailed(cause?: unknown): MajikFileError {
+    return new MajikFileError(
+      "LEGACY_MIGRATION_FAILED",
+      "Failed to migrate a legacy MajikFile record to the current schema",
+      cause,
+    );
+  }
+
+  /**
+   * Generic "the storage key doesn't match this record's declared storage
+   * class" error. Deliberately platform-neutral (not R2-specific) so any
+   * MajikFile subclass targeting a different storage backend can reuse it.
+   */
+  static storageKeyMismatch(message: string): MajikFileError {
+    return new MajikFileError("STORAGE_KEY_MISMATCH", message);
   }
 }

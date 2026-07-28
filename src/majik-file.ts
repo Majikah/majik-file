@@ -3,131 +3,139 @@ import {
   aesGcmDecrypt,
   generateRandomBytes,
   mlKemEncapsulate,
-  IV_LENGTH,
-  AES_KEY_LEN,
 } from "./core/crypto/crypto-provider";
 import {
-  ML_KEM_SK_LEN,
-  ML_KEM_PK_LEN,
+  IV_LENGTH,
+  AES_KEY_LEN,
   MAX_FILE_SIZE_BYTES,
-  R2_PREFIX,
-  MJKB_VERSION,
+  MAX_GROUP_RECIPIENTS,
+  FILE_SCHEMA_VERSION,
+  CRYPTO_SUITE,
   MJKS_OVERHEAD,
   MJKS_MAGIC_LEN,
   MJKS_MAGIC,
+  MJKB_VERSION,
 } from "./core/crypto/constants";
+import { MajikFileError } from "./core/error";
+import { MajikFileValidator } from "./core/validator";
+import { secureFill, withZeroize } from "./core/crypto/zeroize";
 import {
   sha256Hex,
-  sha256Base64,
-  generateUUID,
   formatBytes,
-  buildPermanentR2Key,
-  buildTemporaryR2Key,
-  buildChatImageR2Key,
-  encodeMjkb,
-  decodeMjkb,
-  resolveAesKeyFromPayload,
-  contextRequiresConversationId,
-  shouldCompressForContext,
-  assertValidMlKemPublicKey,
+  arrayToBase64,
+  generateUUID,
   normaliseToUint8Array,
   normaliseToUint8ArrayAsync,
   isMimeTypeInlineViewable,
   inferMimeTypeFromFilename,
   deriveFilename,
-  isExpired,
-  buildExpiryDate,
-  arrayToBase64,
-  convertImageToWebP,
   deduplicateRecipients,
-  assertRecipientLimit,
+  shouldCompressMime,
+  sha256Base64,
 } from "./core/utils";
+import {
+  encodeMjkb,
+  decodeMjkb,
+  resolveAesKeyFromPayload,
+} from "./core/mjkb-codec";
 import { MajikCompressor } from "./core/compressor/majik-compressor";
-import { MajikFileError } from "./core/error";
+import { isMjkbGroupPayload, hasCompressionFlag } from "./core/types";
 import type {
   MajikFileJSON,
-  CreateOptions,
+  MajikFileCreateOptions,
   MajikFileIdentity,
   MajikFileRecipient,
   MajikFileGroupKey,
   MjkbPayload,
+  AnyMjkbPayload,
   MajikFileStats,
-  FileContext,
-  StorageType,
-  TempFileDuration,
-  MajikMessagePublicKey,
-  FileSignature,
   MajikFileDecryptIdentity,
+  MajikFileKind,
+  FileSignature,
 } from "./core/types";
-import { isMjkbGroupPayload } from "./core/types";
 import {
   MajikSignature,
   type MajikSignerPublicKeys,
   type VerificationResult,
 } from "@majikah/majik-signature";
-import { MajikKey, MajikKeyError } from "@majikah/majik-key";
+import {
+  MajikKey,
+  MajikKeyAddress,
+  MajikKeyError,
+  MajikKeyFingerprint,
+} from "@majikah/majik-key";
 
 /**
  * MajikFile
  * ----------------
- * Post-quantum binary file encryption for Majik Message.
+ * Post-quantum binary file encryption. Platform-agnostic — this class
+ * knows nothing about chat, threads, or storage backends. It owns exactly
+ * what's needed to identify, describe, encrypt, and decrypt a file.
  *
- * Mirrors MajikEnvelope's single/group encryption model, but operates on raw
- * binary blobs rather than plaintext strings.
+ * For Majikah messaging-specific fields (R2 key, storage type, context,
+ * chat/thread bindings, sharing), see MajikMessageFile, which extends this
+ * class rather than duplicating any of its crypto logic.
  *
- * Single-recipient ────────────────────────────────────────────────────────
- * ----------------
- *   ML-KEM encapsulate → 32-byte sharedSecret used directly as AES-256-GCM key.
- *   Payload JSON: { mlKemCipherText }
+ * ─── Extensibility ───────────────────────────────────────────────────────
+ *   Subclasses compose rather than override the crypto pipeline:
+ *     - `_encryptCore()` (protected static) does hash → preprocess →
+ *       compress → encrypt → encode, and is called directly by a
+ *       subclass's own `create()` rather than inherited through it —
+ *       subclasses have their own extra fields to layer on afterward.
+ *     - `_preProcess()` and `_resolveCompressionPolicy()` are protected
+ *       static hooks with generic no-op/mime-only defaults. A subclass
+ *       overrides them (e.g. MajikMessageFile overrides `_preProcess` to
+ *       convert certain FileContexts to WebP). Because `_encryptCore` calls
+ *       `this._preProcess(...)` internally, and static `this` is late-bound
+ *       to whichever class the method was actually invoked on, calling
+ *       `MajikMessageFile._encryptCore(...)` correctly dispatches to
+ *       MajikMessageFile's override — ordinary JS static polymorphism, no
+ *       extra plumbing required.
+ *   decrypt/sign/verify/encode/decode never need subclass awareness at
+ *   all — they operate purely on bytes + identity.
  *
- * Group (2+ recipients) ───────────────────────────────────────────────────
- * ----------------
- *   Generate random 32-byte AES key → encrypt file once.
- *   Per recipient: ML-KEM encapsulate → encryptedAesKey = aesKey XOR sharedSecret.
- *   Payload JSON: { keys: [{ fingerprint, mlKemCipherText, encryptedAesKey }] }
+ * ─── Immutability ────────────────────────────────────────────────────────
+ *   Instances are built exclusively through static factories (`create()`,
+ *   `fromJSON()`, `fromJSONWithBlob()`) which call `_sealInstance()` as the
+ *   last step. `Object.seal()` — not `freeze()` — is used deliberately:
+ *   mutator methods (attachSignature, toggleSharing-style methods in the
+ *   subclass, etc.) still need to reassign *existing* private fields; seal
+ *   blocks adding or deleting properties (no prototype pollution / injected
+ *   fields) while permitting exactly that. Sealing happens in the factory,
+ *   not the constructor, so a subclass constructor has already set all of
+ *   its own fields (via `super()` then its own assignments) before the
+ *   object becomes sealed — no `new.target` gymnastics needed.
  *
- * The owner is always included as the first recipient automatically.
- * Duplicate recipients are silently removed; if the deduplicated list is empty
- * after stripping the owner's own key, single-recipient mode is used.
+ * ─── Versioning ──────────────────────────────────────────────────────────
+ *   Two independent version axes:
+ *     - MJKB_VERSION: the .mjkb binary wire format (see mjkb-codec.ts).
+ *     - schema_version (FILE_SCHEMA_VERSION): the JSON record shape. A
+ *       record with no schema_version at all is legacy (pre-refactor) —
+ *       see MajikMessageFile.isLegacyJSON() / fromLegacyJSON().
+ *   kem_alg / cipher_alg are stamped on every new record (CRYPTO_SUITE) so
+ *   a future suite change is a detectable, migratable fact.
  *
- * ─── Immutability ────────────────────────────────────────────────────────────
- *   MajikFile binaries are write-once. A file cannot be patched or replaced
- *   in place — callers must delete the existing record + R2 object and call
- *   create() again. This is enforced by the absence of any update/patch method
- *   on the encrypted fields.
- *
- * ─── Encrypt pipeline ────────────────────────────────────────────────────────
- *   raw bytes
- *     → SHA-256 hash       (for dedup, computed pre-compression)
- *     → image/webp convert (chat_image always; chat_attachment for images only)
- *     → Zstd compress      (compressible formats only; skipped for already-
- *                           compressed images JPEG/WebP/AVIF and video/audio/archives)
- *     → [single] ML-KEM encapsulate → sharedSecret = AES key
- *       [group]  random AES key; per recipient: ML-KEM encapsulate → XOR wrap
- *     → AES-256-GCM encrypt
- *     → .mjkb binary       (stored in R2)
- *
- * ─── .mjkb binary format ─────────────────────────────────────────────────────
+ * ─── .mjkb binary format (v2) ────────────────────────────────────────────
  *   [4   magic "MJKB"]
  *   [1   version]
  *   [12  AES-GCM IV]
  *   [4   payload JSON length (big-endian uint32)]
- *   [N   payload JSON — MjkbSinglePayload | MjkbGroupPayload]
- *   [M   AES-GCM ciphertext (Zstd-compressed file + 16-byte auth tag)]
- *
- * ─── Decrypt identity ─────────────────────────────────────────────────────────
- *   Every decrypt-related method accepts a MajikFileDecryptIdentity: either a
- *   full (unlocked) MajikKey instance, or the bare { fingerprint, mlKemSecretKey }
- *   shape. Both are resolved and validated through the single private helper
- *   MajikFile._resolveDecryptIdentity() — see that method for details.
+ *   [N   payload JSON — { n, m, z, mlKemCipherText } | { n, m, z, keys }]
+ *   [M   AES-GCM ciphertext]
+ *   `z` is an explicit "was this zstd-compressed" flag set at encrypt time —
+ *   decrypt reads it directly instead of re-deriving a policy decision from
+ *   context, which is what made the pre-refactor binary format secretly
+ *   depend on a messaging-specific concept (FileContext). v1 binaries
+ *   (which used `c` instead of `z`) remain readable — see decodeMjkb() and
+ *   _decryptCore()'s legacy fallback.
  */
 
 // ── Batch / stats types ───────────────────────────────────────────────────
 
-export interface BatchDecryptResult {
+export interface BatchDecryptResult<T extends MajikFile = MajikFile> {
   success: boolean;
-  decrypted: MajikFile[];
-  errors: Array<{ invoiceId: string; reason: string }>;
+  decrypted: T[];
+  errors: Array<{ id: string; reason: string }>;
 }
 
 export interface BatchLockResult {
@@ -135,69 +143,82 @@ export interface BatchLockResult {
   skipped: number; // signed-only files
 }
 
+/** Internal shape returned by _encryptCore() — consumed by create() in this class and its subclasses. */
+export interface EncryptCoreResult {
+  binary: Uint8Array;
+  ivHex: string;
+  fileHash: string;
+  sizeOriginal: number;
+  sizeStored: number;
+  resolvedMimeType: string | null;
+  participants: MajikKeyAddress[];
+  isGroup: boolean;
+}
+
+/** Input shape for _encryptCore() — the crypto-pipeline-only subset of a create() call. */
+export interface EncryptCoreInput {
+  data: Uint8Array | ArrayBuffer;
+  identity: MajikFileIdentity;
+  recipients: MajikFileRecipient[];
+  originalName: string | null;
+  mimeType: string | null;
+  bypassSizeLimit: boolean;
+  compressionLevel?: number;
+}
+
 export class MajikFile {
   // ── Metadata ─────────────────────────────────────────────────────────────
 
-  private readonly _id: string;
-  private readonly _userId: string;
-  private _r2Key: string;
-  private readonly _originalName: string | null;
-  private readonly _mimeType: string | null;
-  private readonly _sizeOriginal: number;
-  private readonly _sizeStored: number;
-  private readonly _fileHash: string;
-  private readonly _encryptionIv: string; // hex, mirrors .mjkb IV for audit only
-  private _storageType: StorageType;
-  private _isShared: boolean;
-  private _shareToken: string | null;
-  private readonly _context: FileContext | null;
-  private _chatMessageId: string | null;
-  private _threadMessageId: string | null;
-  private _threadId: string | null;
-  private _conversationId: string | null;
-  private _participants: MajikMessagePublicKey[];
-  private _expiresAt: string | null;
-  private readonly _timestamp: string | null;
-  private _lastUpdate: string | null; // mutable — updated on mutations
-  private readonly _isGroup: boolean; // derived from payload type at create/parse time
+  protected readonly _id: string;
+  protected readonly _schemaVersion: number;
+  protected readonly _kind: MajikFileKind;
+  protected readonly _userId: string;
+  protected readonly _originalName: string | null;
+  protected readonly _mimeType: string | null;
+  protected readonly _sizeOriginal: number;
+  protected readonly _sizeStored: number;
+  protected readonly _fileHash: string;
+  protected readonly _encryptionIv: string;
+  protected readonly _participants: MajikKeyAddress[];
+  protected readonly _kemAlg: string;
+  protected readonly _cipherAlg: string;
+  protected readonly _timestamp: string | null;
+  protected _lastUpdate: string | null;
+  protected readonly _isGroup: boolean;
 
-  private _signature: string | null;
+  protected _signature: string | null;
+
+  /** Encrypted .mjkb binary. NOT serialised via toJSON() — lives wherever the caller stores it. */
+  protected _binary: Uint8Array | null;
+
+  /** Runtime-only decrypted cache. Zeroized (not just dropped) on secureLock(). */
+  protected _decrypted?: Uint8Array;
+
+  // ── Constructor ────────────────────────────────────────────────────────────
 
   /**
-   * Encrypted .mjkb binary.
-   * NOT serialised to JSON / Supabase — lives in R2 storage only.
+   * Protected — instances are built through static factories (create(),
+   * fromJSON(), fromJSONWithBlob()) so `_sealInstance()` can run only once
+   * every field, base and subclass, has actually been assigned.
    */
-  private _binary: Uint8Array | null;
-
-  // ── Runtime-only decrypted cache (NOT persisted via toJSON) ───────────────
-  private _decrypted?: Uint8Array;
-
-  // ── Private constructor ───────────────────────────────────────────────────
-
-  private constructor(
+  protected constructor(
     json: MajikFileJSON,
     binary: Uint8Array | null,
     isGroup: boolean,
   ) {
     this._id = json.id;
+    this._schemaVersion = json.schema_version;
+    this._kind = json.kind;
     this._userId = json.user_id;
-    this._r2Key = json.r2_key;
     this._originalName = json.original_name;
     this._mimeType = json.mime_type;
     this._sizeOriginal = json.size_original;
     this._sizeStored = json.size_stored;
     this._fileHash = json.file_hash;
     this._encryptionIv = json.encryption_iv;
-    this._storageType = json.storage_type;
-    this._isShared = json.is_shared;
-    this._shareToken = json.share_token;
-    this._context = json.context;
-    this._chatMessageId = json.chat_message_id;
-    this._threadMessageId = json.thread_message_id;
-    this._threadId = json.thread_id;
-    this._conversationId = json.conversation_id;
     this._participants = json.participants;
-    this._expiresAt = json.expires_at;
+    this._kemAlg = json.kem_alg;
+    this._cipherAlg = json.cipher_alg;
     this._timestamp = json.timestamp;
     this._lastUpdate = json.last_update;
     this._binary = binary;
@@ -205,16 +226,29 @@ export class MajikFile {
     this._signature = json.signature;
   }
 
+  /**
+   * Seals the instance so no new properties can be added/removed. Called
+   * as the last step of every static factory — see class-level doc comment
+   * for why this lives here instead of the constructor.
+   */
+  protected _sealInstance(): this {
+    Object.seal(this);
+    return this;
+  }
+
   // ── Getters ───────────────────────────────────────────────────────────────
 
   get id(): string {
     return this._id;
   }
+  get schemaVersion(): number {
+    return this._schemaVersion;
+  }
+  get kind(): MajikFileKind {
+    return this._kind;
+  }
   get userId(): string {
     return this._userId;
-  }
-  get r2Key(): string {
-    return this._r2Key;
   }
   get originalName(): string | null {
     return this._originalName;
@@ -231,55 +265,29 @@ export class MajikFile {
   get fileHash(): string {
     return this._fileHash;
   }
-  /** Original file size in kilobytes (3 decimal places). */
   get sizeKB(): number {
     return Math.round((this._sizeOriginal / 1024) * 1000) / 1000;
   }
-  /** Original file size in megabytes (3 decimal places). */
   get sizeMB(): number {
     return Math.round((this._sizeOriginal / 1024 ** 2) * 1000) / 1000;
   }
-  /** Original file size in gigabytes (3 decimal places). */
   get sizeGB(): number {
     return Math.round((this._sizeOriginal / 1024 ** 3) * 1000) / 1000;
   }
-  /** Original file size in terabytes (3 decimal places). */
   get sizeTB(): number {
     return Math.round((this._sizeOriginal / 1024 ** 4) * 1000) / 1000;
   }
   get encryptionIv(): string {
     return this._encryptionIv;
   }
-  get storageType(): StorageType {
-    return this._storageType;
+  get kemAlg(): string {
+    return this._kemAlg;
   }
-  get isShared(): boolean {
-    return this._isShared;
+  get cipherAlg(): string {
+    return this._cipherAlg;
   }
-  get shareToken(): string | null {
-    return this._shareToken;
-  }
-  get context(): FileContext | null {
-    return this._context;
-  }
-  get chatMessageId(): string | null {
-    return this._chatMessageId;
-  }
-  get threadMessageId(): string | null {
-    return this._threadMessageId;
-  }
-  get threadId(): string | null {
-    return this._threadId;
-  }
-  get participants(): MajikMessagePublicKey[] {
+  get participants(): MajikKeyAddress[] {
     return this._participants;
-  }
-  /** Conversation ID — only populated for chat_image context files. */
-  get conversationId(): string | null {
-    return this._conversationId;
-  }
-  get expiresAt(): string | null {
-    return this._expiresAt;
   }
   get timestamp(): string | null {
     return this._timestamp;
@@ -299,22 +307,17 @@ export class MajikFile {
   get isSingle(): boolean {
     return !this._isGroup;
   }
-
   get hasDecryptedFile(): boolean {
     return this._decrypted !== undefined;
   }
-
-  /** The cached decrypted file, if decryption has run this session. */
+  /** The cached decrypted file, if decryptHydrate() has run this session. */
   get decryptedFile(): Uint8Array | undefined {
     return this._decrypted;
   }
 
   // ── SIGNATURE ─────────────────────────────────────────────────────────────
 
-  /**
-   * Serialized base64 signature string (MajikSignature.serialize() output).
-   * Stored in Supabase as a plain text column. Null when unsigned.
-   */
+  /** Serialized base64 signature string. Stored as a plain text column. Null when unsigned. */
   get signatureRaw(): string | null {
     return this._signature;
   }
@@ -322,7 +325,6 @@ export class MajikFile {
   /**
    * Deserialize and return the attached MajikSignature instance.
    * Returns null if no signature is attached or the stored value is malformed.
-   * Deserializes on every access — avoid calling in tight loops.
    */
   get signature(): MajikSignature | null {
     if (!this._signature?.trim()) return null;
@@ -333,576 +335,263 @@ export class MajikFile {
     }
   }
 
-  /**
-   * Returns true if a structurally valid signature is attached.
-   * Does NOT cryptographically verify — call verify() for that.
-   */
+  /** True if a structurally valid signature is attached. Does NOT cryptographically verify. */
   get isSigned(): boolean {
     return this._signature?.trim() ? true : false;
   }
 
-  // ── CREATE ────────────────────────────────────────────────────────────────
+  // ── EXTENSIBILITY HOOKS (overridden by subclasses) ────────────────────────
 
   /**
-   * Encrypt a raw binary file and produce a MajikFile instance.
-   *
-   * Single-recipient (no `recipients` supplied or empty array):
-   *   ML-KEM encapsulate → sharedSecret → AES-256-GCM key.
-   *
-   * Group (one or more entries in `recipients`):
-   *   Random 32-byte AES key encrypts the file once.
-   *   The owner + every recipient each get their own ML-KEM key entry.
-   *   encryptedAesKey = aesKey XOR sharedSecret  (safe one-time-pad).
-   *
-   * Steps:
-   *  1. Validate inputs and enforce size limit
-   *  2. Infer MIME type from filename if not provided
-   *  3. Compute SHA-256 file_hash (original bytes, pre-compression)
-   *  4. Zstd compress at level 22
-   *  5. Encrypt (single or group path)
-   *  6. Encode to .mjkb binary → store in _binary
-   *  7. Build metadata + validate
-   *
-   * @throws MajikFileError on validation or crypto failure
+   * No-op by default — returns the input unchanged. MajikMessageFile
+   * overrides this to convert certain FileContexts to WebP before
+   * compression/encryption. See class-level doc comment for the dispatch
+   * mechanism (late-bound static `this`).
    */
-  static async create(options: CreateOptions): Promise<MajikFile> {
-    const {
-      data,
-      identity,
-      context,
-      recipients = [],
-      originalName = null,
-      mimeType: rawMimeType = null,
-      isTemporary = false,
-      isShared = false,
-      id = generateUUID(),
-      bypassSizeLimit = false,
-      expiresAt,
-      chatMessageId = null,
-      threadMessageId = null,
-      threadId = null,
-      conversationId = null,
-      userId,
-      compressionLevel,
-    } = options;
+  protected static async _preProcess(
+    raw: Uint8Array,
+    mimeType: string | null,
+  ): Promise<{ bytes: Uint8Array; mimeType: string | null }> {
+    return { bytes: raw, mimeType };
+  }
 
-    // ── Input validation ─────────────────────────────────────────────────
+  /**
+   * Mime-only compression policy by default. A subclass may override to
+   * fold in additional context, but the base default alone is what makes
+   * legacy v1 binaries (which lack the `z` flag) decodable without the
+   * base layer needing to know what a FileContext is.
+   */
+  protected static _resolveCompressionPolicy(mimeType: string | null): boolean {
+    return shouldCompressMime(mimeType);
+  }
 
-    if (!data) throw MajikFileError.invalidInput("data is required");
-    if (!identity) throw MajikFileError.invalidInput("identity is required");
-    if (!userId?.trim())
-      throw MajikFileError.invalidInput("userId is required");
-    if (!identity.fingerprint?.trim())
+  // ── ENCRYPT CORE (shared by create() here and in every subclass) ─────────
+
+  /**
+   * Hash → preprocess (hook) → compress (policy hook) → encrypt →
+   * encode .mjkb. Called directly (not inherited via create()) by every
+   * subclass's own create() implementation, since each layers different
+   * extra fields on top of the result.
+   *
+   * Zeroization: every derived secret (ML-KEM shared secrets, the random
+   * group AES key) is wiped immediately after use via withZeroize()/
+   * secureFill(), in a `finally` so cleanup survives an early throw.
+   *
+   * @throws MajikFileError on validation or crypto failure.
+   */
+  protected static async _encryptCore(
+    input: EncryptCoreInput,
+  ): Promise<EncryptCoreResult> {
+    const raw = normaliseToUint8Array(input.data);
+
+    MajikFileValidator.assertNonEmptyData(raw.byteLength);
+    MajikFileValidator.assertSizeWithinLimit(
+      raw.byteLength,
+      MAX_FILE_SIZE_BYTES,
+      input.bypassSizeLimit,
+    );
+    if (!input.identity?.fingerprint?.trim()) {
       throw MajikFileError.invalidInput("identity.fingerprint is required");
-    assertValidMlKemPublicKey(
-      identity.mlKemPublicKey,
+    }
+    MajikFileValidator.assertMlKemPublicKey(
+      input.identity.mlKemPublicKey,
       "identity.mlKemPublicKey",
     );
-
-    if (
-      ![
-        "user_upload",
-        "chat_attachment",
-        "chat_image",
-        "chat_voice",
-        "thread_attachment",
-      ].includes(context)
-    ) {
-      throw MajikFileError.invalidInput(`Invalid context: "${context}"`);
-    }
-    if (contextRequiresConversationId(context) && !conversationId?.trim()) {
-      throw MajikFileError.invalidInput(
-        `conversationId is required when context is "${context}"`,
-      );
-    }
-    if (chatMessageId && threadMessageId) {
-      throw MajikFileError.invalidInput(
-        "chatMessageId and threadMessageId are mutually exclusive",
-      );
-    }
-    if (isTemporary && !expiresAt) {
-      throw MajikFileError.invalidInput(
-        "expiresAt is required for temporary files. Use MajikFile.buildExpiryDate() to generate one.",
-      );
-    }
-
-    // Validate extra recipients' public keys
-    for (let i = 0; i < recipients.length; i++) {
-      const r = recipients[i];
+    for (let i = 0; i < input.recipients.length; i++) {
+      const r = input.recipients[i];
       if (!r.fingerprint?.trim()) {
         throw MajikFileError.invalidInput(
           `recipients[${i}].fingerprint is required`,
         );
       }
-      assertValidMlKemPublicKey(
+      MajikFileValidator.assertMlKemPublicKey(
         r.mlKemPublicKey,
         `recipients[${i}].mlKemPublicKey`,
       );
     }
 
-    const raw = normaliseToUint8Array(data);
-
-    if (raw.byteLength === 0)
-      throw MajikFileError.invalidInput("data must not be empty");
-    if (!bypassSizeLimit && raw.byteLength > MAX_FILE_SIZE_BYTES) {
-      throw MajikFileError.sizeExceeded(raw.byteLength, MAX_FILE_SIZE_BYTES);
-    }
-
-    // ── Infer MIME type from filename if not provided ─────────────────────
-    const mimeType =
-      rawMimeType ??
-      (originalName ? inferMimeTypeFromFilename(originalName) : null);
-
     try {
-      // ── 1. Hash (pre-compression, for dedup) ──────────────────────────
-      // Always hash the raw original bytes — before any image conversion or
-      // compression — so the hash is stable regardless of context.
+      // Hash the ORIGINAL bytes — before any preprocessing/compression —
+      // so dedup stays stable regardless of what a subclass's preprocess
+      // hook does to the bytes downstream.
       const fileHash = sha256Hex(raw);
 
-      // ── 2. Image conversion (chat_attachment only) ────────────────────
-      // For chat attachments, all browser-convertible images are re-encoded
-      // to WebP (quality 0.88) before compression. This normalises delivery
-      // format and reduces size for PNG/BMP sources.
-      // The file_hash above already captures the *original* bytes, so dedup
-      // across contexts still works correctly.
-      let processedBytes = raw;
-      let resolvedMimeType = mimeType;
+      const { bytes: processedBytes, mimeType: resolvedMimeType } =
+        await this._preProcess(raw, input.mimeType);
 
-      // chat_image: always convert (the entire context is for images)
-      // chat_attachment: convert if the attached file happens to be an image
-      if (
-        (context === "chat_image" || context === "chat_attachment") &&
-        mimeType?.startsWith("image/")
-      ) {
-        const result = await convertImageToWebP(raw, mimeType);
-        processedBytes = result.bytes;
-        resolvedMimeType = result.mimeType; // "image/webp" on success, original on fallback
-      }
-
-      // ── 3. Compress (compressible formats only) ───────────────────────
-      // Delegates to shouldCompressForContext() — the same context-aware
-      // policy the decrypt path checks, so the two can never drift apart.
-      const compressible = shouldCompressForContext(context, resolvedMimeType);
-      const compressed = compressible
-        ? await MajikCompressor.compress(processedBytes, compressionLevel)
+      const compress = this._resolveCompressionPolicy(resolvedMimeType);
+      const compressed = compress
+        ? await MajikCompressor.compress(processedBytes, input.compressionLevel)
         : processedBytes;
 
-      // ── 4. IV ─────────────────────────────────────────────────────────
       const iv = generateRandomBytes(IV_LENGTH);
       const ivHex = Array.from(iv)
         .map((b) => b.toString(16).padStart(2, "0"))
         .join("");
 
-      // ── 5. Encrypt ────────────────────────────────────────────────────
-      // cleanedRecipients has the owner's key removed and duplicates stripped.
-      // If it is empty after cleaning, treat as single-recipient.
-
       const cleanedRecipients = deduplicateRecipients(
-        recipients,
-        identity.fingerprint,
+        input.recipients,
+        input.identity.fingerprint,
       );
-      assertRecipientLimit(cleanedRecipients);
+      MajikFileValidator.assertRecipientLimit(
+        cleanedRecipients.length,
+        MAX_GROUP_RECIPIENTS,
+      );
 
-      // Owner is always the first key entry
       const allRecipients: MajikFileRecipient[] = [
         {
-          fingerprint: identity.fingerprint,
-          mlKemPublicKey: identity.mlKemPublicKey,
-          publicKey: identity.publicKey,
+          fingerprint: input.identity.fingerprint,
+          mlKemPublicKey: input.identity.mlKemPublicKey,
+          publicKey: input.identity.publicKey,
         },
         ...cleanedRecipients,
       ];
-
-      const participantPubKeys = allRecipients.map(
-        (recipient) => recipient.publicKey,
-      );
-
+      const participantPubKeys = allRecipients.map((r) => r.publicKey);
       const isGroupFile = cleanedRecipients.length > 0;
 
       let ciphertext: Uint8Array;
       let payload: MjkbPayload;
 
       if (!isGroupFile) {
-        // ── Single ───────────────────────────────────────────────────────
         const { sharedSecret, cipherText: mlKemCT } = mlKemEncapsulate(
-          identity.mlKemPublicKey,
+          input.identity.mlKemPublicKey,
         );
-        ciphertext = aesGcmEncrypt(sharedSecret, iv, compressed);
-
+        ciphertext = withZeroize([sharedSecret], () =>
+          aesGcmEncrypt(sharedSecret, iv, compressed),
+        );
         payload = {
           mlKemCipherText: arrayToBase64(mlKemCT),
-          n: originalName ?? null,
+          n: input.originalName ?? null,
           m: resolvedMimeType ?? null,
-          c: context ?? null,
+          z: compress,
         };
       } else {
-        // ── Group ─────────────────────────────────────────────────────────
-        // Random group AES key encrypts the file once
         const aesKey = generateRandomBytes(AES_KEY_LEN);
-        ciphertext = aesGcmEncrypt(aesKey, iv, compressed);
-
-        const keys: MajikFileGroupKey[] = allRecipients.map((r) => {
-          const { sharedSecret, cipherText: mlKemCT } = mlKemEncapsulate(
-            r.mlKemPublicKey,
-          );
-          // One-time-pad: safe because sharedSecret is 32 uniformly random bytes
-          const encryptedAesKey = new Uint8Array(AES_KEY_LEN);
-          for (let i = 0; i < AES_KEY_LEN; i++) {
-            encryptedAesKey[i] = aesKey[i] ^ sharedSecret[i];
-          }
-          return {
-            fingerprint: r.fingerprint,
-            mlKemCipherText: arrayToBase64(mlKemCT),
-            encryptedAesKey: arrayToBase64(encryptedAesKey),
+        try {
+          ciphertext = aesGcmEncrypt(aesKey, iv, compressed);
+          const keys: MajikFileGroupKey[] = allRecipients.map((r) => {
+            const { sharedSecret, cipherText: mlKemCT } = mlKemEncapsulate(
+              r.mlKemPublicKey,
+            );
+            return withZeroize([sharedSecret], () => {
+              const encryptedAesKey = new Uint8Array(AES_KEY_LEN);
+              for (let i = 0; i < AES_KEY_LEN; i++) {
+                encryptedAesKey[i] = aesKey[i] ^ sharedSecret[i];
+              }
+              return {
+                fingerprint: r.fingerprint,
+                mlKemCipherText: arrayToBase64(mlKemCT),
+                encryptedAesKey: arrayToBase64(encryptedAesKey),
+              };
+            });
+          });
+          payload = {
+            keys,
+            n: input.originalName ?? null,
+            m: resolvedMimeType ?? null,
+            z: compress,
           };
-        });
-
-        payload = {
-          keys,
-          n: originalName ?? null,
-          m: resolvedMimeType ?? null,
-          c: context ?? null,
-        };
+        } finally {
+          secureFill(aesKey);
+        }
       }
 
-      // ── 6. Encode .mjkb ───────────────────────────────────────────────
       const mjkbBytes = encodeMjkb(iv, payload, ciphertext);
 
-      // ── 7. R2 key ─────────────────────────────────────────────────────
-      // chat_image gets its own conversation-scoped prefix, enabling efficient
-      // batch-deletion when a conversation is removed (single R2 prefix scan).
-      let r2Key: string;
-      if (context === "chat_image") {
-        r2Key = buildChatImageR2Key(conversationId!, userId, fileHash);
-      } else if (isTemporary) {
-        r2Key = buildTemporaryR2Key(userId, fileHash, expiresAt); // default TTL at creation time
-      } else {
-        r2Key = buildPermanentR2Key(userId, fileHash);
-      }
-
-      const now = new Date().toISOString();
-
-      const json: MajikFileJSON = {
-        id,
-        user_id: userId,
-        r2_key: r2Key,
-        original_name: originalName,
-        mime_type: resolvedMimeType,
-        size_original: raw.byteLength,
-        size_stored: mjkbBytes.byteLength,
-        file_hash: fileHash,
-        encryption_iv: ivHex,
-        storage_type: isTemporary ? "temporary" : "permanent",
-        is_shared: isShared,
-        share_token: null,
-        context,
-        chat_message_id: chatMessageId,
-        thread_message_id: threadMessageId,
-        thread_id: threadId,
-        conversation_id: conversationId,
-        expires_at: buildExpiryDate(expiresAt),
-        timestamp: now,
-        last_update: now,
+      return {
+        binary: mjkbBytes,
+        ivHex,
+        fileHash,
+        sizeOriginal: raw.byteLength,
+        sizeStored: mjkbBytes.byteLength,
+        resolvedMimeType,
         participants: participantPubKeys,
-        signature: null,
+        isGroup: isGroupFile,
       };
-
-      const instance = new MajikFile(json, mjkbBytes, isGroupFile);
-      instance._validateCreate();
-      return instance;
     } catch (err) {
       if (err instanceof MajikFileError) throw err;
       throw MajikFileError.encryptionFailed(err);
     }
   }
 
-  // ── CREATE AND SIGN ───────────────────────────────────────────────────────
+  // ── CREATE ────────────────────────────────────────────────────────────────
 
   /**
-   * Encrypt a raw binary file, sign the resulting .mjkb binary, and return
-   * the MajikFile instance with the signature already attached.
-   *
-   * This is a convenience wrapper around create() + sign() for the common
-   * case where the file owner wants to sign immediately after encryption.
-   *
-   * The signature covers the encrypted .mjkb binary bytes — not the
-   * plaintext — so verification can be performed by any party holding the
-   * signer's public keys without requiring decryption. See sign() for the
-   * full rationale.
-   *
-   * Typical usage:
-   *   const file = await MajikFile.createAndSign(options, key);
-   *   await r2.put(file.r2Key, file.toMJKB());
-   *   await supabase.from("majik_files").insert(file.toJSON());
-   *   // toJSON() includes the serialized signature — one round-trip to Supabase.
-   *
-   * @param options  Same CreateOptions accepted by create().
-   * @param key      Unlocked MajikKey with signing keys (Ed25519 + ML-DSA-87).
-   * @param signOptions  Optional content type label and timestamp override.
-   * @returns        MajikFile instance with _signature populated and _binary loaded.
-   * @throws MajikFileError on any encryption or validation failure.
-   * @throws MajikSignatureKeyError if the key is locked or missing signing keys.
+   * Encrypt a raw binary file and produce a base MajikFile instance. Use
+   * this directly for a generic encrypted-file use case; for Majikah
+   * messaging fields use MajikMessageFile.create() (or its quick-create
+   * wrappers) instead — they share this same crypto pipeline via
+   * _encryptCore(), not by inheriting this method.
    */
+  static async create(options: MajikFileCreateOptions): Promise<MajikFile> {
+    const {
+      data,
+      identity,
+      recipients = [],
+      originalName = null,
+      mimeType: rawMimeType = null,
+      id = generateUUID(),
+      bypassSizeLimit = false,
+      compressionLevel,
+      userId,
+    } = options;
+
+    MajikFileValidator.assertUserId(userId);
+    if (!identity) throw MajikFileError.invalidInput("identity is required");
+
+    const mimeType =
+      rawMimeType ??
+      (originalName ? inferMimeTypeFromFilename(originalName) : null);
+
+    const core = await MajikFile._encryptCore({
+      data,
+      identity,
+      recipients,
+      originalName,
+      mimeType,
+      bypassSizeLimit,
+      compressionLevel,
+    });
+
+    const now = new Date().toISOString();
+    const json: MajikFileJSON = {
+      id,
+      schema_version: FILE_SCHEMA_VERSION,
+      kind: "file",
+      user_id: userId,
+      original_name: originalName,
+      mime_type: core.resolvedMimeType,
+      size_original: core.sizeOriginal,
+      size_stored: core.sizeStored,
+      file_hash: core.fileHash,
+      encryption_iv: core.ivHex,
+      participants: core.participants,
+      kem_alg: CRYPTO_SUITE.kemAlg,
+      cipher_alg: CRYPTO_SUITE.cipherAlg,
+      timestamp: now,
+      last_update: now,
+      signature: null,
+    };
+
+    const instance = new MajikFile(json, core.binary, core.isGroup);
+    instance.validate();
+    return instance._sealInstance();
+  }
+
+  // ── CREATE AND SIGN ───────────────────────────────────────────────────────
+
   static async createAndSign(
-    options: CreateOptions,
+    options: MajikFileCreateOptions,
     key: MajikKey,
     signOptions?: { contentType?: string; timestamp?: string },
   ): Promise<MajikFile> {
     const file = await MajikFile.create(options);
-    // _binary is guaranteed non-null here — create() always populates it
-    // and the instance was just constructed, so clearBinary() hasn't run.
     await file.sign(key, signOptions);
     return file;
   }
 
-  // ── QUICK-CREATE WRAPPERS ─────────────────────────────────────────────────
-
-  /**
-   * Create a chat image file.
-   * Validates that the file is an image and does not exceed 25 MB (original bytes).
-   */
-  static async createChatImage(options: {
-    data: Uint8Array | ArrayBuffer;
-    userId: string;
-    identity: MajikFileIdentity;
-    conversationId: string;
-    mimeType: string;
-    originalName?: string;
-    recipients?: MajikFileRecipient[];
-    chatMessageId?: string;
-  }): Promise<MajikFile> {
-    const raw =
-      options.data instanceof Uint8Array
-        ? options.data
-        : new Uint8Array(options.data);
-
-    if (!options.mimeType?.startsWith("image/")) {
-      throw MajikFileError.invalidInput(
-        `createChatImage: mimeType must be an image/* type (got "${options.mimeType}")`,
-      );
-    }
-    const CHAT_IMAGE_MAX = 25 * 1024 * 1024; // 25 MB
-    if (raw.byteLength > CHAT_IMAGE_MAX) {
-      throw MajikFileError.sizeExceeded(raw.byteLength, CHAT_IMAGE_MAX);
-    }
-
-    return MajikFile.create({
-      data: raw,
-      userId: options.userId,
-      identity: options.identity,
-      context: "chat_image",
-      conversationId: options.conversationId,
-      mimeType: options.mimeType,
-      originalName: options.originalName,
-      recipients: options.recipients ?? [],
-      chatMessageId: options.chatMessageId,
-      isTemporary: false,
-    });
-  }
-
-  /**
-   * Create a chat attachment file.
-   */
-  static async createChatAttachment(options: {
-    data: Uint8Array | ArrayBuffer;
-    userId: string;
-    identity: MajikFileIdentity;
-    chatMessageId: string;
-    originalName?: string;
-    mimeType?: string;
-    recipients?: MajikFileRecipient[];
-  }): Promise<MajikFile> {
-    return MajikFile.create({
-      data: options.data,
-      userId: options.userId,
-      identity: options.identity,
-      context: "chat_attachment",
-      chatMessageId: options.chatMessageId,
-      originalName: options.originalName,
-      mimeType: options.mimeType,
-      recipients: options.recipients ?? [],
-      isTemporary: false,
-    });
-  }
-
-  /**
-   * Create a thread attachment file.
-   */
-  static async createThreadAttachment(options: {
-    data: Uint8Array | ArrayBuffer;
-    userId: string;
-    identity: MajikFileIdentity;
-    threadId: string;
-    threadMessageId?: string;
-    originalName?: string;
-    mimeType?: string;
-    recipients?: MajikFileRecipient[];
-  }): Promise<MajikFile> {
-    return MajikFile.create({
-      data: options.data,
-      userId: options.userId,
-      identity: options.identity,
-      context: "thread_attachment",
-      threadId: options.threadId,
-      threadMessageId: options.threadMessageId,
-      originalName: options.originalName,
-      mimeType: options.mimeType,
-      recipients: options.recipients ?? [],
-      isTemporary: false,
-    });
-  }
-
-  /**
-   * Create a permanent user upload.
-   */
-  static async createUserUpload(options: {
-    data: Uint8Array | ArrayBuffer;
-    userId: string;
-    identity: MajikFileIdentity;
-    originalName?: string;
-    mimeType?: string;
-    isShared?: boolean;
-    recipients?: MajikFileRecipient[];
-  }): Promise<MajikFile> {
-    return MajikFile.create({
-      data: options.data,
-      userId: options.userId,
-      identity: options.identity,
-      context: "user_upload",
-      originalName: options.originalName,
-      mimeType: options.mimeType,
-      isShared: options.isShared ?? false,
-      recipients: options.recipients ?? [],
-      isTemporary: false,
-    });
-  }
-
-  /**
-   * Create a temporary user upload with a typed TTL.
-   * @param duration  Days until expiry. Defaults to 15.
-   */
-  static async createTemporaryUpload(options: {
-    data: Uint8Array | ArrayBuffer;
-    userId: string;
-    identity: MajikFileIdentity;
-    originalName?: string;
-    mimeType?: string;
-    duration?: TempFileDuration;
-    recipients?: MajikFileRecipient[];
-  }): Promise<MajikFile> {
-    const duration = options.duration ?? 15;
-    return MajikFile.create({
-      data: options.data,
-      userId: options.userId,
-      identity: options.identity,
-      context: "user_upload",
-      originalName: options.originalName,
-      mimeType: options.mimeType,
-      recipients: options.recipients ?? [],
-      isTemporary: true,
-      expiresAt: duration,
-    });
-  }
-
-  // ── PARTICIPANT ACCESS CHECKS ─────────────────────────────────────────────
-
-  /**
-   * Returns true if the given public key string is in the participants list
-   * for this file. O(n) scan — participants lists are small in practice.
-   *
-   * Note: participants contains the *recipients'* public keys. The owner's
-   * key is NOT included (the owner encrypts to themselves via identity, not
-   * via the recipients array). To check owner access use `userIsOwner()`.
-   */
-  hasParticipantAccess(publicKey: MajikMessagePublicKey): boolean {
-    if (!publicKey?.trim()) return false;
-    return this._participants.includes(publicKey);
-  }
-
-  /**
-   * Bind this file to a thread mail after initial creation.
-   * Can only be called once — throws if either ID is already set.
-   * Call toJSON() and persist to Supabase after binding.
-   */
-  bindToThreadMail(threadId: string, threadMessageId: string): void {
-    if (this._context !== "thread_attachment") {
-      throw MajikFileError.invalidInput(
-        "bindToThreadMail: only thread_attachment files can be bound to a mail",
-      );
-    }
-
-    // Check for missing arguments FIRST to satisfy the missing ID tests
-    if (!threadId?.trim()) {
-      throw MajikFileError.invalidInput(
-        "bindToThreadMail: threadId is required",
-      );
-    }
-    if (!threadMessageId?.trim()) {
-      throw MajikFileError.invalidInput(
-        "bindToThreadMail: threadMessageId is required",
-      );
-    }
-
-    // Ensure the message ID hasn't been locked yet
-    if (this._threadMessageId) {
-      throw MajikFileError.invalidInput(
-        "bindToThreadMail: this file is already bound to a thread mail — " +
-          "IDs are immutable once set",
-      );
-    }
-
-    // Ensure we aren't trying to overwrite an existing thread ID with a new one
-    if (this._threadId && this._threadId !== threadId) {
-      throw MajikFileError.invalidInput(
-        "bindToThreadMail: this file is already bound to a different thread mail",
-      );
-    }
-
-    this._threadId = threadId;
-    this._threadMessageId = threadMessageId;
-    this._lastUpdate = new Date().toISOString();
-  }
-
-  /**
-   * Bind this file to a chat conversation after initial creation.
-   * Can only be called once — throws if either ID is already set.
-   * Call toJSON() and persist to Supabase after binding.
-   */
-  bindToChatConversation(conversationID: string, chatMessageID: string): void {
-    if (this._context !== "chat_attachment") {
-      throw MajikFileError.invalidInput(
-        "bindToChatConversation: only chat_attachment files can be bound to a mail",
-      );
-    }
-    if (this._chatMessageId || this._conversationId) {
-      throw MajikFileError.invalidInput(
-        "bindToChatConversation: this file is already bound to a chat conversation — " +
-          "IDs are immutable once set",
-      );
-    }
-    if (!conversationID?.trim()) {
-      throw MajikFileError.invalidInput(
-        "bindToChatConversation: conversationID is required",
-      );
-    }
-    if (!chatMessageID?.trim()) {
-      throw MajikFileError.invalidInput(
-        "bindToChatConversation: chatMessageID is required",
-      );
-    }
-    this._conversationId = conversationID;
-    this._chatMessageId = chatMessageID;
-    this._lastUpdate = new Date().toISOString();
-  }
-
   // ── IDENTITY RESOLUTION (decrypt-related methods) ─────────────────────────
 
-  /**
-   * Duck/type-narrowing check used to distinguish a MajikKey instance from
-   * every other accepted shape (a bare identity object for decryption, or
-   * MajikSignerPublicKeys for signature verification). Single canonical
-   * check reused everywhere that discrimination is needed.
-   */
   private static _isMajikKey<T>(v: MajikKey | T): v is MajikKey {
     return v instanceof MajikKey;
   }
@@ -910,12 +599,7 @@ export class MajikFile {
   /**
    * Resolve any accepted decrypt-identity shape down to the minimal
    * { fingerprint, mlKemSecretKey } pair, validating along the way.
-   *
-   * This is the single entry point every decrypt-related method funnels
-   * through — decrypt(), decryptWithMetadata(), decryptBinary(),
-   * decryptHydrate(), verifyBinary(), and batchDecrypt() all accept either
-   * a full (unlocked) MajikKey instance or a bare MajikFileIdentity-shaped
-   * object interchangeably.
+   * Every decrypt-related method funnels through this.
    *
    * @throws MajikFileError if identity is missing or the ML-KEM secret key
    *         is the wrong length.
@@ -929,7 +613,7 @@ export class MajikFile {
       throw MajikFileError.invalidInput("identity is required for decryption");
     }
 
-    let fingerprint: string;
+    let fingerprint: MajikKeyFingerprint;
     let mlKemSecretKey: Uint8Array | undefined;
 
     if (MajikFile._isMajikKey(input)) {
@@ -943,36 +627,34 @@ export class MajikFile {
       mlKemSecretKey = input.mlKemSecretKey;
     }
 
-    if (
-      !(mlKemSecretKey instanceof Uint8Array) ||
-      mlKemSecretKey.length !== ML_KEM_SK_LEN
-    ) {
-      throw MajikFileError.invalidInput(
-        `identity.mlKemSecretKey must be ${ML_KEM_SK_LEN} bytes (got ${
-          mlKemSecretKey?.length ?? "undefined"
-        })`,
-      );
-    }
-
-    return { fingerprint, mlKemSecretKey };
+    MajikFileValidator.assertMlKemSecretKey(
+      mlKemSecretKey,
+      "identity.mlKemSecretKey",
+    );
+    return { fingerprint, mlKemSecretKey: mlKemSecretKey! };
   }
 
   // ── DECRYPT (static) ──────────────────────────────────────────────────────
 
   /**
    * Core decrypt routine shared by decrypt() and decryptWithMetadata().
-   * Decodes the .mjkb binary, recovers the AES key (single or group path via
-   * resolveAesKeyFromPayload), authenticates + decrypts, and decompresses
-   * using the same context-aware policy applied at encrypt time.
+   * Decodes the .mjkb binary, recovers the AES key (single or group path),
+   * authenticates + decrypts, and decompresses using the `z` flag when
+   * present (v2) or the mime-only fallback policy for legacy v1 binaries.
+   *
+   * Zeroization: the derived AES key is wiped in a `finally` immediately
+   * after the decrypt attempt, regardless of success. If decompression
+   * runs, the pre-decompression compressed buffer is wiped once the final
+   * plaintext exists — it's a redundant copy of sensitive data at that point.
    *
    * Note: ML-KEM decapsulation NEVER throws on a wrong key — it returns a
    * garbage shared secret. AES-GCM authentication catches this silently
-   * (aesGcmDecrypt returns null), which we surface as decryptionFailed().
+   * (aesGcmDecrypt returns null), surfaced here as decryptionFailed().
    */
   private static async _decryptCore(
     source: Blob | Uint8Array | ArrayBuffer,
     identity: MajikFileDecryptIdentity,
-  ): Promise<{ bytes: Uint8Array; payload: MjkbPayload }> {
+  ): Promise<{ bytes: Uint8Array; payload: AnyMjkbPayload }> {
     const resolved = MajikFile._resolveDecryptIdentity(identity);
 
     try {
@@ -982,16 +664,32 @@ export class MajikFile {
       const { iv, payload, ciphertext } = decodeMjkb(raw);
 
       const aesKey = resolveAesKeyFromPayload(payload, resolved);
-      const decrypted = aesGcmDecrypt(aesKey, iv, ciphertext);
+      let decrypted: Uint8Array | null;
+      try {
+        decrypted = aesGcmDecrypt(aesKey, iv, ciphertext);
+      } finally {
+        secureFill(aesKey);
+      }
+
       if (!decrypted) {
         throw MajikFileError.decryptionFailed(
           "Decryption failed — wrong key or corrupted .mjkb file",
         );
       }
 
-      const bytes = shouldCompressForContext(payload.c, payload.m)
+      const shouldDecompress = hasCompressionFlag(payload)
+        ? payload.z
+        : shouldCompressMime(payload.m); // legacy v1 fallback — mime-only, no context needed
+
+      const bytes = shouldDecompress
         ? await MajikCompressor.decompress(decrypted)
         : decrypted;
+
+      if (shouldDecompress) {
+        // `decrypted` (the compressed intermediate) is now a redundant copy
+        // of sensitive content once `bytes` holds the decompressed result.
+        secureFill(decrypted);
+      }
 
       return { bytes, payload };
     } catch (err) {
@@ -1002,10 +700,6 @@ export class MajikFile {
 
   /**
    * Decrypt a .mjkb Blob, Uint8Array, or ArrayBuffer.
-   *
-   * Accepts either a full (unlocked) MajikKey instance or a bare
-   * { fingerprint, mlKemSecretKey } identity — see _resolveDecryptIdentity().
-   *
    * @throws MajikFileError on wrong key, missing key entry, corrupt data, or format errors.
    * @throws MajikKeyError if a MajikKey input is locked.
    */
@@ -1019,23 +713,8 @@ export class MajikFile {
 
   /**
    * Decrypt a .mjkb binary and return the raw bytes together with the
-   * original filename, MIME type, and any attached signature that was
-   * embedded in the Supabase record at encryption time.
-   *
-   * Signature handling:
-   *   - If a signature string is provided via `signatureRaw`, it is
-   *     deserialized and returned as `signature` for the caller to verify.
-   *   - If no signature is present, `signature` is null — the rest of the
-   *     return shape is unchanged so existing call sites need no updates.
-   *   - This method does NOT verify the signature. To verify, pass the
-   *     returned signature to file.verify() or MajikSignature.verify().
-   *
-   * This is the preferred method for the File Vault UI because it avoids a
-   * second parse of the binary — everything comes from the single decodeMjkb
-   * call that decryption already performs.
-   *
-   * @returns `{ bytes, originalName, mimeType, signature }` where
-   *          `originalName`, `mimeType`, and `signature` may be null.
+   * original filename, MIME type, and any attached signature.
+   * Does NOT verify the signature — pass it to file.verify() for that.
    */
   static async decryptWithMetadata(
     source: Blob | Uint8Array | ArrayBuffer,
@@ -1049,9 +728,6 @@ export class MajikFile {
   }> {
     const { bytes, payload } = await MajikFile._decryptCore(source, identity);
 
-    // Deserialize if a raw signature string was provided. Malformed values
-    // are silently swallowed — the caller receives null and can decide
-    // whether to treat that as an error based on their own policy.
     let signature: MajikSignature | null = null;
     if (signatureRaw?.trim()) {
       try {
@@ -1065,10 +741,7 @@ export class MajikFile {
   }
 
   /**
-   * Instance wrapper around MajikFile.decryptWithMetadata() that automatically
-   * passes the attached signature for deserialization.
-   * Convenience method — avoids manually threading signatureRaw at call sites.
-   *
+   * Instance wrapper — automatically passes the attached signature.
    * @throws MajikFileError if _binary is not loaded or decryption fails.
    */
   async decryptWithMetadata(identity: MajikFileDecryptIdentity): Promise<{
@@ -1087,8 +760,6 @@ export class MajikFile {
 
   /**
    * Decrypt the .mjkb binary already loaded on this instance.
-   * Convenience wrapper around MajikFile.decrypt() — avoids re-fetching from R2.
-   *
    * @throws MajikFileError if _binary is not loaded or decryption fails.
    */
   async decryptBinary(identity: MajikFileDecryptIdentity): Promise<Uint8Array> {
@@ -1098,73 +769,71 @@ export class MajikFile {
 
   /**
    * Decrypt the loaded binary and cache the plaintext on `_decrypted`.
-   * Returns `this` for chaining. The cache is runtime-only — it is never
-   * included in toJSON(); use toDangerousJSON() if you explicitly need to
-   * serialise it.
+   * Any stale cache is zeroized before being replaced. Returns `this`.
    */
-  async decryptHydrate(identity: MajikFileDecryptIdentity): Promise<MajikFile> {
+  async decryptHydrate(identity: MajikFileDecryptIdentity): Promise<this> {
     if (!this._binary) throw MajikFileError.missingBinary();
+    if (this._decrypted) secureFill(this._decrypted);
     const { bytes } = await MajikFile._decryptCore(this._binary, identity);
     this._decrypted = bytes;
     return this;
   }
 
   /**
-   * Check whether a given MajikKey can decrypt this file.
-   *
-   * For single-recipient envelopes: checks if the key's fingerprint matches.
-   * For group envelopes: checks if the fingerprint is in the participants list.
-   * Does not attempt actual decryption — fingerprint check only.
+   * Check whether a given key can decrypt this file by verifying recipient capability.
    */
-  canDecrypt(key: MajikKey | Pick<MajikFileIdentity, "fingerprint">): boolean {
-    return this._participants.includes(key.fingerprint);
+  canDecrypt(key: MajikKey | Partial<MajikFileIdentity>): boolean {
+    // _participants stores public keys (MajikKeyAddress strings).
+    // Extract the public key depending on whether a MajikKey or MajikFileIdentity was passed.
+    const pubKey =
+      (key as MajikKey).publicKeyBase64 || (key as MajikFileIdentity).publicKey;
+
+    if (pubKey) {
+      return this._participants.includes(pubKey);
+    }
+
+    // Fallback check just in case
+    if (key.fingerprint) {
+      return this._participants.includes(key.fingerprint);
+    }
+
+    return false;
   }
 
   // ==========================================================================
-  // ── Batch Operations ──────────────────────────────────────────────────────────
+  // ── Batch Operations ──────────────────────────────────────────────────────
   // ==========================================================================
 
   /**
-   * Decrypt an array of MajikFile instances concurrently.
-   * Signed-only files are passed through unchanged (they need no decryption).
-   * Encrypted files that cannot be decrypted with the provided key are
-   * collected in the errors array and excluded from `decrypted`.
-   *
-   * @param files  - Array of MajikFile to process
-   * @param key       - An unlocked MajikKey authorised to decrypt the files
-   * @returns BatchDecryptResult
+   * Decrypt an array of MajikFile (or subclass) instances concurrently.
+   * Always attempts to hydrate/unlock the file directly. Files that cannot be
+   * decrypted are collected in `errors` and excluded from `decrypted`.
    */
-  static async batchDecrypt(
-    files: MajikFile[],
-    key: MajikKey,
-  ): Promise<BatchDecryptResult> {
-    // Resolve + validate once up front — fails fast before touching any file,
-    // and reuses the same locked-key / missing-secret-key check as every
-    // other decrypt-related method.
+  static async batchDecrypt<T extends MajikFile>(
+    files: T[],
+    key: MajikKey | MajikFileDecryptIdentity,
+  ): Promise<BatchDecryptResult<T>> {
     MajikFile._resolveDecryptIdentity(key);
 
-    const errors: BatchDecryptResult["errors"] = [];
+    const errors: BatchDecryptResult<T>["errors"] = [];
 
     const results = await Promise.allSettled(
       files.map(async (file) => {
         if (file.hasDecryptedFile) return file;
-        if (!file.canDecrypt(key)) {
-          throw new Error(
-            `Key "${key.fingerprint}" is not a participant of this file.`,
-          );
-        }
-        return file.decryptHydrate(key);
+
+        // Removed the canDecrypt check — always attempt to unlock
+        await file.decryptHydrate(key);
+        return file;
       }),
     );
 
-    const decrypted: MajikFile[] = [];
-
+    const decrypted: T[] = [];
     results.forEach((result, i) => {
       if (result.status === "fulfilled") {
         decrypted.push(result.value);
       } else {
         errors.push({
-          invoiceId: files[i].id,
+          id: files[i].id,
           reason:
             result.reason instanceof Error
               ? result.reason.message
@@ -1173,26 +842,13 @@ export class MajikFile {
       }
     });
 
-    return {
-      success: errors.length === 0,
-      decrypted,
-      errors,
-    };
+    return { success: errors.length === 0, decrypted, errors };
   }
 
-  /**
-   * Clears the in-memory decrypted cache from all encrypted files.
-   * Signed-only files are skipped (nothing to lock).
-   *
-   * Call this after you're done with a batch to minimise plaintext in memory.
-   *
-   * @param files - Array of MajikFile to lock
-   * @returns BatchLockResult with counts of locked vs skipped
-   */
-  static batchLock(files: MajikFile[]): BatchLockResult {
+  /** Zeroizes and clears the in-memory decrypted cache from all encrypted files in the batch. */
+  static batchLock<T extends MajikFile>(files: T[]): BatchLockResult {
     let locked = 0;
     let skipped = 0;
-
     for (const file of files) {
       if (!file.hasDecryptedFile) {
         skipped++;
@@ -1201,116 +857,39 @@ export class MajikFile {
       file.secureLock();
       locked++;
     }
-
     return { locked, skipped };
   }
 
-  /**
-   * Securely clears runtime-sensitive decrypted state from memory.
-   *
-   * - Only affects in-memory cache
-   */
+  /** Zeroizes and clears the runtime-only decrypted cache. */
   secureLock(): this {
+    if (this._decrypted) secureFill(this._decrypted);
     this._decrypted = undefined;
     return this;
-  }
-
-  // ── STORAGE TYPE MUTATION ─────────────────────────────────────────────────
-
-  /**
-   * Mutate the storage type in-place and rebuild the R2 key to match.
-   *
-   * This is intentionally a low-level escape hatch. Prefer the convenience
-   * wrappers `setPermanent()` and `setTemporary(days?)` which enforce the
-   * required invariants automatically.
-   *
-   * @throws MajikFileError when switching to temporary without an expiresAt,
-   *         or if the instance has no userId / fileHash yet.
-   */
-  setStorageType(
-    type: StorageType,
-    expiresAt: string | null,
-    duration: TempFileDuration = 15,
-  ): void {
-    if (!["permanent", "temporary"].includes(type)) {
-      throw MajikFileError.invalidInput(
-        `setStorageType: type must be "permanent" or "temporary" (got "${type}")`,
-      );
-    }
-    if (type === "temporary" && !expiresAt) {
-      throw MajikFileError.invalidInput(
-        "setStorageType: expiresAt is required when switching to temporary. " +
-          "Use setTemporary(days?) instead.",
-      );
-    }
-    if (this._context === "chat_image") {
-      throw MajikFileError.invalidInput(
-        "setStorageType: chat_image files are conversation-scoped and cannot change storage type.",
-      );
-    }
-
-    const newR2Key =
-      type === "temporary"
-        ? buildTemporaryR2Key(this._userId, this._fileHash, duration)
-        : buildPermanentR2Key(this._userId, this._fileHash);
-
-    this._storageType = type;
-    this._expiresAt = type === "temporary" ? expiresAt : null;
-    this._r2Key = newR2Key;
-    this._lastUpdate = new Date().toISOString();
-  }
-  /**
-   * Switch to permanent storage. Clears any expiry date and updates the R2 key.
-   */
-  setPermanent(): void {
-    this.setStorageType("permanent", null);
-  }
-
-  /**
-   * Switch to temporary storage with a typed TTL duration.
-   * The duration determines both the R2 prefix bucket and the expiry date.
-   *
-   * @param duration  Days until expiry. Must be one of: 1 | 2 | 3 | 5 | 7 | 15.
-   *                  Defaults to 15 to match the R2 lifecycle policy.
-   */
-  setTemporary(duration: TempFileDuration = 15): void {
-    this.setStorageType(
-      "temporary",
-      MajikFile.buildExpiryDate(duration),
-      duration,
-    );
   }
 
   // ── SERIALISATION ─────────────────────────────────────────────────────────
 
   /**
-   * Serialise metadata to a plain object matching the `majik_files` Supabase table.
-   * The encrypted binary (_binary) AND the in-memory decrypted cache
-   * (_decrypted) are intentionally excluded. Use toDangerousJSON() if you
-   * explicitly need the decrypted plaintext included.
+   * Serialise metadata to a plain object. The encrypted binary (_binary)
+   * AND the in-memory decrypted cache (_decrypted) are intentionally
+   * excluded — use toDangerousJSON() if you explicitly need the plaintext.
    */
   toJSON(): MajikFileJSON {
     this.validate();
     return {
       id: this._id,
+      schema_version: this._schemaVersion,
+      kind: this._kind,
       user_id: this._userId,
-      r2_key: this._r2Key,
       original_name: this._originalName,
       mime_type: this._mimeType,
       size_original: this._sizeOriginal,
       size_stored: this._sizeStored,
       file_hash: this._fileHash,
       encryption_iv: this._encryptionIv,
-      storage_type: this._storageType,
-      is_shared: this._isShared,
-      share_token: this._shareToken,
-      context: this._context,
-      chat_message_id: this._chatMessageId,
-      thread_message_id: this._threadMessageId,
-      thread_id: this._threadId,
       participants: this._participants,
-      conversation_id: this._conversationId,
-      expires_at: this._expiresAt,
+      kem_alg: this._kemAlg,
+      cipher_alg: this._cipherAlg,
       timestamp: this._timestamp,
       last_update: this._lastUpdate,
       signature: this._signature ?? null,
@@ -1320,13 +899,9 @@ export class MajikFile {
   /**
    * Like toJSON(), but also includes the in-memory decrypted plaintext
    * (base64-encoded) if decryptHydrate() has populated it this session.
-   * `decrypted_base64` is null if nothing has been decrypted yet.
    *
-   * ⚠️ DANGEROUS: this exposes plaintext file contents in the serialised
-   * output. Never persist the result to Supabase or any shared/long-lived
-   * store — this exists only for call sites that explicitly need the
-   * decrypted bytes alongside the metadata (e.g. short-lived local caching)
-   * and are prepared to handle that plaintext responsibly.
+   * ⚠️ DANGEROUS: exposes plaintext file contents in the serialised output.
+   * Never persist the result to any shared/long-lived store.
    */
   toDangerousJSON(): MajikFileJSON & { decrypted_base64: string | null } {
     return {
@@ -1337,14 +912,8 @@ export class MajikFile {
 
   /**
    * Restore a MajikFile from its serialised JSON representation.
-   *
-   * The R2 prefix check is intentionally NOT performed here — rows restored
-   * from Supabase may have been written by earlier code or migrations and
-   * should not be rejected at read time.
-   *
-   * @param json   MajikFileJSON — typically a Supabase row.
-   * @param binary Optional encrypted .mjkb bytes. When provided the instance is
-   *               immediately ready for toMJKB() / decryptBinary().
+   * @param json   MajikFileJSON — must carry schema_version FILE_SCHEMA_VERSION or lower.
+   * @param binary Optional encrypted .mjkb bytes.
    */
   static fromJSON(
     json: MajikFileJSON,
@@ -1355,29 +924,28 @@ export class MajikFile {
         "fromJSON: json must be a non-null object",
       );
     }
+    MajikFileValidator.assertSchemaVersion(
+      json.schema_version,
+      FILE_SCHEMA_VERSION,
+    );
 
     const binaryBytes = binary != null ? normaliseToUint8Array(binary) : null;
 
-    // Derive isGroup by peeking at the binary payload if available;
-    // fall back to false (single) for metadata-only restores.
     let isGroup = false;
     if (binaryBytes) {
       try {
         const { payload } = decodeMjkb(binaryBytes);
         isGroup = isMjkbGroupPayload(payload);
       } catch {
-        // Binary is malformed — let validate() catch it later
+        // Binary is malformed — let validate() / downstream use catch it.
       }
     }
 
     const instance = new MajikFile(json, binaryBytes, isGroup);
     instance.validate();
-    return instance;
+    return instance._sealInstance();
   }
 
-  /**
-   * Async variant of fromJSON that accepts a Blob for the binary parameter.
-   */
   static async fromJSONWithBlob(
     json: MajikFileJSON,
     binary: Blob,
@@ -1388,10 +956,6 @@ export class MajikFile {
 
   // ── toMJKB / toBinaryBytes ────────────────────────────────────────────────
 
-  /**
-   * Export the encrypted binary as a .mjkb Blob for upload to R2.
-   * @throws MajikFileError if _binary is not loaded.
-   */
   toMJKB(): Blob {
     if (!this._binary) throw MajikFileError.missingBinary();
     return new Blob([this._binary as BlobPart], {
@@ -1399,25 +963,17 @@ export class MajikFile {
     });
   }
 
-  /**
-   * Returns true if the binary has a MJKS signed trailer appended.
-   * O(1) — checks only the last 4 bytes.
-   */
   static hasMjksTrailer(data: Uint8Array): boolean {
-    if (data.length < MJKS_OVERHEAD + 23) return false; // 23 = min valid .mjkb
+    if (data.length < MJKS_OVERHEAD + 23) return false;
     const tail = data.subarray(data.length - MJKS_MAGIC_LEN);
     return (
-      tail[0] === 0x4d &&
-      tail[1] === 0x4a &&
-      tail[2] === 0x4b &&
-      tail[3] === 0x53
+      tail[0] === MJKS_MAGIC[0] &&
+      tail[1] === MJKS_MAGIC[1] &&
+      tail[2] === MJKS_MAGIC[2] &&
+      tail[3] === MJKS_MAGIC[3]
     );
   }
 
-  /**
-   * Extract the embedded MajikSignature from a MJKS-trailered binary.
-   * Returns null if no trailer is present or the JSON is malformed.
-   */
   static extractMjksSignature(data: Uint8Array): MajikSignature | null {
     if (!MajikFile.hasMjksTrailer(data)) return null;
     try {
@@ -1439,10 +995,6 @@ export class MajikFile {
     }
   }
 
-  /**
-   * Strip the MJKS trailer and return the original .mjkb bytes.
-   * If no trailer is present, returns the input unchanged (safe to call unconditionally).
-   */
   static stripMjksTrailer(data: Uint8Array): Uint8Array {
     if (!MajikFile.hasMjksTrailer(data)) return data;
     const lengthOffset = data.length - MJKS_OVERHEAD;
@@ -1456,16 +1008,8 @@ export class MajikFile {
 
   /**
    * Export the encrypted binary with the attached MajikSignature appended
-   * as a MJKS trailer. Offline recipients can extract and verify the
-   * signature without a Supabase round-trip.
-   *
-   * Format: [.mjkb bytes][sig JSON UTF-8][uint32 BE sig length]["MJKS"]
-   *
-   * The base .mjkb bytes are identical to toMJKB() — decryption tools that
-   * don't understand the trailer can strip it with stripMjksTrailer() or
-   * simply use decrypt() which calls stripMjksTrailer() automatically.
-   *
-   * @throws MajikFileError if _binary is not loaded or no signature is attached.
+   * as a MJKS trailer — offline recipients can verify without a database
+   * round-trip. Format: [.mjkb bytes][sig JSON][uint32 BE len]["MJKS"].
    */
   toSignedMJKB(): Blob {
     if (!this._binary) throw MajikFileError.missingBinary();
@@ -1481,13 +1025,11 @@ export class MajikFile {
 
     const trailer = new Uint8Array(sigBytes.length + MJKS_OVERHEAD);
     trailer.set(sigBytes, 0);
-    // uint32 BE length
     const len = sigBytes.length;
     trailer[len] = (len >>> 24) & 0xff;
     trailer[len + 1] = (len >>> 16) & 0xff;
     trailer[len + 2] = (len >>> 8) & 0xff;
     trailer[len + 3] = len & 0xff;
-    // "MJKS" magic suffix
     trailer.set(MJKS_MAGIC, len + 4);
 
     return new Blob([this._binary as BlobPart, trailer], {
@@ -1495,10 +1037,6 @@ export class MajikFile {
     });
   }
 
-  /**
-   * Export the encrypted binary as a raw Uint8Array.
-   * @throws MajikFileError if _binary is not loaded.
-   */
   toBinaryBytes(): Uint8Array {
     if (!this._binary) throw MajikFileError.missingBinary();
     return this._binary;
@@ -1507,103 +1045,42 @@ export class MajikFile {
   // ── VALIDATE ──────────────────────────────────────────────────────────────
 
   /**
-   * Validate all required properties against business invariants.
-   * Collects ALL errors before throwing so the full list is visible at once.
-   *
-   * NOTE: R2 prefix structure is only checked during create(), not here.
-   * This keeps fromJSON() tolerant of rows written by other services.
-   *
-   * @throws MajikFileError
+   * Validate all required base properties. Collects ALL errors before
+   * throwing so the full list is visible at once. Subclasses call this via
+   * super.validate() equivalent (MajikMessageFileValidator rules) and add
+   * their own — see MajikMessageFile.validate().
    */
   validate(): void {
     const errors: string[] = [];
+    const push = (err: string | null) => {
+      if (err) errors.push(err);
+    };
 
-    if (!this._id?.trim()) errors.push("id is required");
-    if (!this._userId?.trim()) errors.push("user_id is required");
-    if (!this._r2Key?.trim()) errors.push("r2_key is required");
-    if (typeof this._sizeOriginal !== "number" || this._sizeOriginal < 0) {
-      errors.push("size_original must be a non-negative number");
-    }
-    if (typeof this._sizeStored !== "number" || this._sizeStored < 0) {
-      errors.push("size_stored must be a non-negative number");
-    }
-    if (!this._fileHash?.trim()) errors.push("file_hash is required");
-    if (!this._encryptionIv?.trim()) errors.push("encryption_iv is required");
-    if (!["permanent", "temporary"].includes(this._storageType)) {
-      errors.push(
-        `storage_type must be "permanent" or "temporary" (got "${this._storageType}")`,
-      );
-    }
-    if (
-      this._context !== null &&
-      ![
-        "user_upload",
-        "chat_attachment",
-        "chat_image",
-        "chat_voice",
-        "thread_attachment",
-      ].includes(this._context)
-    ) {
-      errors.push(
-        "context must be user_upload | chat_attachment | chat_image | chat_voice | thread_attachment",
-      );
-    }
-    if (this._chatMessageId && this._threadMessageId) {
-      errors.push("chat_message_id and thread_message_id cannot both be set");
-    }
-    if (
-      contextRequiresConversationId(this._context) &&
-      !this._conversationId?.trim()
-    ) {
-      errors.push(`conversation_id is required for ${this._context} context`);
-    }
-    if (this._storageType === "temporary" && !this._expiresAt) {
-      errors.push("expires_at is required for temporary files");
-    }
+    push(MajikFileValidator.checkId(this._id));
+    push(MajikFileValidator.checkUserId(this._userId));
+    push(MajikFileValidator.checkFileHash(this._fileHash));
+    push(MajikFileValidator.checkEncryptionIv(this._encryptionIv));
+    push(
+      MajikFileValidator.checkNonNegativeSize(
+        this._sizeOriginal,
+        "size_original",
+      ),
+    );
+    push(
+      MajikFileValidator.checkNonNegativeSize(this._sizeStored, "size_stored"),
+    );
+    push(
+      MajikFileValidator.checkSchemaVersion(
+        this._schemaVersion,
+        FILE_SCHEMA_VERSION,
+      ),
+    );
 
-    if (errors.length > 0) throw MajikFileError.validationFailed(errors);
-  }
-
-  /**
-   * Stricter validation used only during create() — includes R2 prefix checks.
-   */
-  private _validateCreate(): void {
-    this.validate();
-
-    const errors: string[] = [];
-    const permanentPrefix = `${R2_PREFIX.PERMANENT}/${this._userId}/`;
-    const temporaryPrefix = `${R2_PREFIX.TEMPORARY}/`;
-
-    const chatImagePrefix = `${R2_PREFIX.CHAT_IMAGE}/`;
-
-    if (this._context === "chat_image") {
-      if (!this._r2Key.startsWith(chatImagePrefix)) {
-        errors.push(
-          `r2_key for chat_image files must start with "${chatImagePrefix}"`,
-        );
-      }
-    } else if (
-      this._storageType === "permanent" &&
-      !this._r2Key.startsWith(permanentPrefix)
-    ) {
-      errors.push(
-        `r2_key for permanent files must start with "${permanentPrefix}"`,
-      );
-    } else if (
-      this._storageType === "temporary" &&
-      !this._r2Key.startsWith(temporaryPrefix)
-    ) {
-      errors.push(
-        `r2_key for temporary files must start with "${temporaryPrefix}"`,
-      );
-    }
-
-    if (errors.length > 0) throw MajikFileError.validationFailed(errors);
+    MajikFileValidator.assertAll(errors);
   }
 
   // ── OWNERSHIP ─────────────────────────────────────────────────────────────
 
-  /** Returns true if the given userId matches the file's owner. */
   userIsOwner(userId: string): boolean {
     if (!userId?.trim()) return false;
     return this._userId === userId;
@@ -1611,89 +1088,57 @@ export class MajikFile {
 
   // ── BINARY MANAGEMENT ─────────────────────────────────────────────────────
 
-  /**
-   * Attach (or replace) the encrypted .mjkb binary on this instance.
-   * Also updates the isGroup flag by peeking at the payload type.
-   */
   attachBinary(binary: Uint8Array | ArrayBuffer): void {
     this._binary = normaliseToUint8Array(binary);
   }
 
-  /**
-   * Clear the in-memory binary to free memory after an upload completes.
-   */
   clearBinary(): void {
     this._binary = null;
   }
 
-  // ── SHARING ───────────────────────────────────────────────────────────────
+  // ── PARTICIPANT ACCESS ────────────────────────────────────────────────────
 
-  /** Returns true if this file has an active share token. */
-  get hasShareToken(): boolean {
-    return this._shareToken !== null && this._shareToken.length > 0;
+  /**
+   * True if the given public key string is in the participants list.
+   * Note: participants are the *recipients'* public keys — the owner's key
+   * is not included (owner self-encrypts via identity). For owner checks
+   * use userIsOwner().
+   */
+  hasParticipantAccess(publicKey: MajikKeyAddress): boolean {
+    if (!publicKey?.trim()) return false;
+    return this._participants.includes(publicKey);
   }
 
   /**
-   * Toggle the shareable state of this file.
-   *
-   * - If currently NOT shared → sets isShared = true, assigns token (auto-generated if omitted).
-   * - If currently shared     → sets isShared = false, clears token.
-   *
-   * Updates last_update automatically. Call toJSON() to persist the change.
-   *
-   * @param token  Optional explicit token. Ignored when toggling OFF.
-   * @returns      The active share token, or null if sharing was disabled.
+   * Lightweight fingerprint check — true if publicKey hashes (SHA-256
+   * base64) to ownerFingerprint. Does NOT attempt decryption.
    */
-  toggleSharing(token?: string): string | null {
-    if (this._isShared) {
-      this._isShared = false;
-      this._shareToken = null;
-      this._lastUpdate = new Date().toISOString();
-      return null;
-    } else {
-      if (token !== undefined && !token.trim()) {
-        throw MajikFileError.invalidInput(
-          "toggleSharing: token must be a non-empty string when provided",
-        );
-      }
-      this._isShared = true;
-      this._shareToken = token?.trim() ?? generateUUID();
-      this._lastUpdate = new Date().toISOString();
-      return this._shareToken;
+  static hasPublicKeyAccess(
+    publicKey: Uint8Array,
+    ownerFingerprint: MajikKeyFingerprint,
+  ): boolean {
+    MajikFileValidator.assertMlKemPublicKey(publicKey, "publicKey");
+    if (!ownerFingerprint?.trim()) {
+      throw MajikFileError.invalidInput(
+        "hasPublicKeyAccess: ownerFingerprint is required",
+      );
     }
-  }
 
-  // ── EXPIRY ────────────────────────────────────────────────────────────────
-
-  /** Returns true if this file has passed its expiry date. */
-  get isExpired(): boolean {
-    return isExpired(this._expiresAt);
-  }
-
-  /** Returns true if this file uses temporary storage. */
-  get isTemporary(): boolean {
-    return this._storageType === "temporary";
+    return sha256Base64(publicKey) === ownerFingerprint;
   }
 
   // ── MIME / FORMAT HELPERS ─────────────────────────────────────────────────
 
-  /** Returns true if the MIME type can be rendered inline in a browser. */
   get isInlineViewable(): boolean {
     return isMimeTypeInlineViewable(this._mimeType);
   }
 
-  /** Safe download filename derived from the hash + original extension. */
   get safeFilename(): string {
     return deriveFilename(this._fileHash, this._originalName);
   }
 
   // ── SIZE CHECK ────────────────────────────────────────────────────────────
 
-  /**
-   * Returns true if the original file size exceeds the given limit.
-   * @param limitMB  Limit in megabytes (must be positive and finite).
-   * @throws MajikFileError on invalid input.
-   */
   exceedsSize(limitMB: number): boolean {
     if (typeof limitMB !== "number" || limitMB <= 0 || !isFinite(limitMB)) {
       throw MajikFileError.invalidInput(
@@ -1703,42 +1148,8 @@ export class MajikFile {
     return this._sizeOriginal > limitMB * 1024 * 1024;
   }
 
-  // ── ACCESS CHECK ──────────────────────────────────────────────────────────
-
-  /**
-   * Lightweight fingerprint check — returns true if the given public key
-   * hashes (SHA-256 base64) to the supplied ownerFingerprint.
-   *
-   * This does NOT attempt decryption. For cryptographic proof use decrypt().
-   *
-   * @param publicKey         ML-KEM-768 public key (1184 bytes).
-   * @param ownerFingerprint  Base64 SHA-256 fingerprint of the authorised key.
-   */
-  static hasPublicKeyAccess(
-    publicKey: Uint8Array,
-    ownerFingerprint: string,
-  ): boolean {
-    if (
-      !(publicKey instanceof Uint8Array) ||
-      publicKey.length !== ML_KEM_PK_LEN
-    ) {
-      throw MajikFileError.invalidInput(
-        `hasPublicKeyAccess: publicKey must be a ${ML_KEM_PK_LEN}-byte Uint8Array (got ${
-          (publicKey as any)?.length ?? typeof publicKey
-        })`,
-      );
-    }
-    if (!ownerFingerprint?.trim()) {
-      throw MajikFileError.invalidInput(
-        "hasPublicKeyAccess: ownerFingerprint is required",
-      );
-    }
-    return sha256Base64(publicKey) === ownerFingerprint;
-  }
-
   // ── STATS ─────────────────────────────────────────────────────────────────
 
-  /** Return a human-readable stats snapshot for display in a file manager UI. */
   getStats(): MajikFileStats {
     return {
       id: this._id,
@@ -1751,83 +1162,49 @@ export class MajikFile {
         this._sizeStored,
       ),
       fileHash: this._fileHash,
-      storageType: this._storageType,
       isGroup: this._isGroup,
-      context: this._context,
-      isShared: this._isShared,
-      isExpired: this.isExpired,
-      expiresAt: this._expiresAt,
-      timestamp: this._timestamp,
-      r2Key: this._r2Key,
       isSigned: this.isSigned,
     };
   }
 
   // ── DUPLICATE DETECTION ───────────────────────────────────────────────────
 
-  /**
-   * Returns true if this file has the same plaintext content as another
-   * MajikFile (comparison by SHA-256 file_hash of original bytes).
-   */
   isDuplicateOf(other: MajikFile): boolean {
     return this._fileHash === other._fileHash;
   }
 
-  /**
-   * Synchronous check — returns true if raw bytes would produce a duplicate.
-   * Use this to short-circuit the encrypt + upload flow.
-   */
   static wouldBeDuplicate(rawBytes: Uint8Array, existingHash: string): boolean {
     return sha256Hex(rawBytes) === existingHash;
   }
 
   // ── STATIC HELPERS ────────────────────────────────────────────────────────
 
-  /**
-   * Quick magic-byte check. Does NOT fully parse — use before attempting decryption.
-   */
   static isMjkbCandidate(data: Uint8Array | ArrayBuffer): boolean {
     const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
     if (bytes.length < 5) return false;
     return (
-      bytes[0] === 0x4d && // M
-      bytes[1] === 0x4a && // J
-      bytes[2] === 0x4b && // K
-      bytes[3] === 0x42 // B
+      bytes[0] === 0x4d &&
+      bytes[1] === 0x4a &&
+      bytes[2] === 0x4b &&
+      bytes[3] === 0x42
     );
   }
 
-  /**
-   * Build a default ISO-8601 expiry date for temporary files.
-   * @param days Days from now. Defaults to 15 (R2 lifecycle policy).
-   */
-  static buildExpiryDate(days: TempFileDuration = 15): string {
-    return buildExpiryDate(days);
-  }
-
-  /** Format bytes as a human-readable string (e.g. "4.2 MB"). */
   static formatBytes(bytes: number): string {
     return formatBytes(bytes);
   }
 
-  /**
-   * Infer a MIME type from a filename extension.
-   * Exposed here for convenience — delegates to core/utils.
-   */
   static inferMimeType(filename: string): string | null {
     return inferMimeTypeFromFilename(filename);
   }
 
-  // ── toString ──────────────────────────────────────────────────────────────
-
   toString(): string {
     return (
-      `MajikFile { ` +
+      `${this.constructor.name} { ` +
       `id: ${this._id}, ` +
       `hash: ${this._fileHash.slice(0, 8)}…, ` +
       `size: ${formatBytes(this._sizeOriginal)}, ` +
       `type: ${this._isGroup ? "group" : "single"}, ` +
-      `storage: ${this._storageType}, ` +
       `signed: ${this.isSigned}` +
       ` }`
     );
@@ -1835,61 +1212,36 @@ export class MajikFile {
 
   /**
    * Fully validate a .mjkb binary beyond the quick magic-byte check.
-   *
-   * Checks performed (in order):
-   *  1. Minimum byte length for a complete fixed header (21 bytes)
-   *  2. Magic bytes "MJKB" at offset 0
-   *  3. Version byte matches MJKB_VERSION (0x01)
-   *  4. Payload JSON length field is positive and not larger than remaining data
-   *  5. Payload JSON is valid UTF-8 and parses without error
-   *  6. Parsed payload is either a MjkbSinglePayload or MjkbGroupPayload shape
-   *  7. Ciphertext section is non-empty (at least 1 byte after the payload)
-   *
-   * Unlike isMjkbCandidate(), this method parses the full header. It does NOT
-   * attempt decryption — use decrypt() for cryptographic verification.
-   *
-   * @param data  Raw bytes to inspect. Accepts Uint8Array or ArrayBuffer.
-   * @returns     true if the binary is structurally valid; false otherwise.
+   * Version-agnostic on payload shape — accepts either v1 (`c`) or v2
+   * (`z`) payloads, as long as the single/group crypto material is present.
+   * Does NOT attempt decryption.
    */
   static isValidMJKB(data: Uint8Array | ArrayBuffer): boolean {
     try {
       const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
-
-      // 1. Minimum size: 4 magic + 1 version + 12 IV + 4 payload-len = 21 bytes,
-      //    plus at least 1 byte of payload JSON and 1 byte of ciphertext.
       if (bytes.length < 23) return false;
-
-      // 2. Magic bytes
       if (
-        bytes[0] !== 0x4d || // M
-        bytes[1] !== 0x4a || // J
-        bytes[2] !== 0x4b || // K
-        bytes[3] !== 0x42 // B
-      )
+        bytes[0] !== 0x4d ||
+        bytes[1] !== 0x4a ||
+        bytes[2] !== 0x4b ||
+        bytes[3] !== 0x42
+      ) {
         return false;
+      }
 
-      // 3. Version
-      if (bytes[4] !== MJKB_VERSION) return false;
-
-      // Skip IV (bytes 5–16) — we don't validate randomness, only structure.
+      const version = bytes[4];
       const payloadLenOffset = 17; // 4 magic + 1 version + 12 IV
-
-      // 4. Payload JSON length (big-endian uint32)
       const payloadLen =
         (bytes[payloadLenOffset] << 24) |
         (bytes[payloadLenOffset + 1] << 16) |
         (bytes[payloadLenOffset + 2] << 8) |
         bytes[payloadLenOffset + 3];
-
       if (payloadLen <= 0) return false;
 
-      const payloadStart = payloadLenOffset + 4; // 21
+      const payloadStart = payloadLenOffset + 4;
       const ciphertextStart = payloadStart + payloadLen;
-
-      // Ensure the declared payload fits and leaves at least 1 byte for ciphertext
       if (ciphertextStart >= bytes.length) return false;
 
-      // 5. Payload JSON must parse
       let payload: unknown;
       try {
         payload = JSON.parse(
@@ -1898,10 +1250,8 @@ export class MajikFile {
       } catch {
         return false;
       }
-
       if (!payload || typeof payload !== "object") return false;
 
-      // 6. Must be a recognisable single or group payload shape
       const isSingle =
         "mlKemCipherText" in (payload as object) &&
         !("keys" in (payload as object));
@@ -1909,48 +1259,23 @@ export class MajikFile {
         "keys" in (payload as object) &&
         Array.isArray((payload as { keys: unknown }).keys) &&
         (payload as { keys: unknown[] }).keys.length > 0;
-
       if (!isSingle && !isGroup) return false;
 
-      // 7. Ciphertext section must be non-empty
       if (bytes.length <= ciphertextStart) return false;
 
+      void version; // version itself isn't part of the structural check — decodeMjkb() enforces it
       return true;
     } catch {
-      // Any unexpected error → not a valid .mjkb
       return false;
     }
   }
 
-  /**
-   * Return the raw plaintext byte size of a Uint8Array or ArrayBuffer.
-   *
-   * This is a cheap O(1) helper — it reads `.byteLength` without copying.
-   * Use it to inspect file size before calling create() or to feed into
-   * `MajikCompressor.adaptiveLevel()` for manual level selection.
-   *
-   * @param data  Raw bytes — typically the plaintext before encryption.
-   * @returns     Byte length as a plain number.
-   *
-   * @example
-   * const size = MajikFile.getRawFileSize(rawBytes);
-   * const level = MajikCompressor.adaptiveLevel(rawBytes, CompressionPreset.ULTRA);
-   */
   static getRawFileSize(data: Uint8Array | ArrayBuffer): number {
     return data instanceof Uint8Array ? data.byteLength : data.byteLength;
   }
 
-  /**
-   * Attach a pre-computed MajikSignature to this file.
-   * Replaces any existing signature — idempotent re-signing is safe.
-   * Call toJSON() and persist to Supabase after attaching.
-   *
-   * Use this when you have already called MajikSignature.sign() yourself
-   * and want to store the result. For a one-shot sign + attach, use sign().
-   *
-   * @param signature  MajikSignature instance or its serialized base64 string.
-   * @throws MajikFileError if the value is an empty string.
-   */
+  // ── SIGNING ──────────────────────────────────────────────────────────────
+
   attachSignature(signature: MajikSignature | string): void {
     if (typeof signature === "string") {
       if (!signature.trim()) {
@@ -1958,7 +1283,6 @@ export class MajikFile {
           "attachSignature: signature string must be non-empty",
         );
       }
-      // Validate the string is actually deserializable before storing
       try {
         MajikSignature.deserialize(signature);
       } catch (err) {
@@ -1975,11 +1299,6 @@ export class MajikFile {
     this._lastUpdate = new Date().toISOString();
   }
 
-  /**
-   * Remove the attached signature from this file.
-   * No-op if no signature is attached.
-   * Call toJSON() and persist to Supabase after removing.
-   */
   removeSignature(): void {
     if (this._signature === null) return;
     this._signature = null;
@@ -1987,38 +1306,15 @@ export class MajikFile {
   }
 
   /**
-   * Sign the loaded .mjkb binary and attach the resulting signature.
-   *
-   * The signature covers the encrypted binary bytes — exactly what is
-   * stored in R2. This means verification does not require decryption:
-   * any party with the signer's public keys can verify storage integrity
-   * without access to the ML-KEM secret key.
-   *
-   * Signing the encrypted binary (not the plaintext) is intentional:
-   *   - The binary is the canonical artifact — it's what gets stored, fetched,
-   *     and transferred. Signing it proves the ciphertext hasn't been tampered
-   *     with since the owner created it.
-   *   - Verification requires no decryption, making it safe to run in
-   *     public/server contexts that only have the signer's public keys.
-   *   - If you need to prove plaintext authenticity, use verifyBinary()
-   *     which decrypts first and then checks the hash.
-   *
-   * Replaces any existing signature — re-signing after mutations is safe
-   * as long as the binary has not changed (binaries are write-once).
-   *
-   * @param key      Unlocked MajikKey with signing keys (Ed25519 + ML-DSA-87).
-   * @param options  Optional content type label and timestamp override.
-   * @returns        The attached MajikSignature instance.
-   * @throws MajikFileError if the binary is not loaded.
-   * @throws MajikSignatureKeyError if the key is locked or missing signing keys.
+   * Sign the loaded .mjkb binary and attach the resulting signature. The
+   * signature covers the encrypted binary — verification never requires
+   * decryption. Replaces any existing signature.
    */
   async sign(
     key: MajikKey,
     options?: { contentType?: string; timestamp?: string },
   ): Promise<MajikSignature> {
-    if (!this._binary) {
-      throw MajikFileError.missingBinary();
-    }
+    if (!this._binary) throw MajikFileError.missingBinary();
     const sig = await MajikSignature.sign(this._binary, key, {
       contentType: options?.contentType ?? this._mimeType ?? undefined,
       timestamp: options?.timestamp,
@@ -2029,23 +1325,8 @@ export class MajikFile {
 
   /**
    * Verify the attached signature against the loaded .mjkb binary.
-   *
-   * Requires the binary to be loaded in memory (_binary !== null).
-   * Returns null instead of throwing when the binary is absent or no
-   * signature is attached — callers can treat null as "cannot verify."
-   *
-   * To distinguish "unsigned" from "binary not loaded", check isSigned
-   * before calling:
-   *
-   *   if (!file.isSigned) // definitively unsigned
-   *   const result = file.verify(key);
-   *   if (result === null) // binary not loaded — fetch from R2 first
-   *   if (!result.valid)   // signature present but verification failed
-   *
-   * For full plaintext verification (decrypt then verify), use verifyBinary().
-   *
-   * @param keyOrPublicKeys  MajikKey instance (locked or unlocked) or raw public keys.
-   * @returns VerificationResult, or null if unsigned or binary not loaded.
+   * Returns null if unsigned or the binary isn't loaded — check isSigned
+   * first to distinguish "unsigned" from "binary not loaded."
    */
   verify(
     keyOrPublicKeys: MajikKey | MajikSignerPublicKeys,
@@ -2067,31 +1348,15 @@ export class MajikFile {
   }
 
   /**
-   * Decrypt the loaded .mjkb binary (to confirm it is well-formed and the
-   * given identity can actually access it), then verify the attached
-   * signature against the encrypted binary — the same artifact that sign()
-   * signs and that verify() / verifySignedMJKB() check.
-   *
-   * This does NOT verify a hash of the plaintext specifically — the
-   * signature always covers ciphertext. Decryption here is a correctness
-   * gate (wrong key / corrupted file will throw), not a re-targeting of
-   * what gets verified. Use this when you want both "can this identity
-   * decrypt it" and "is the ciphertext unmodified" confirmed in one call.
-   *
-   * @param identity         Decrypt identity — MajikKey instance or bare
-   *                         { fingerprint, mlKemSecretKey }, see decrypt().
-   * @param keyOrPublicKeys  Signer's public keys for signature verification.
-   * @returns VerificationResult with valid: true/false.
-   * @throws MajikFileError if binary is not loaded, no signature is attached,
-   *         or decryption fails (wrong key / corrupted data).
+   * Decrypt (as a correctness gate — proves the given identity can access
+   * this file and the ciphertext is well-formed), then verify the attached
+   * signature against the same encrypted binary that sign()/verify() use.
    */
   async verifyBinary(
     identity: MajikFileDecryptIdentity,
     keyOrPublicKeys: MajikKey | MajikSignerPublicKeys,
   ): Promise<VerificationResult> {
-    if (!this._binary) {
-      throw MajikFileError.missingBinary();
-    }
+    if (!this._binary) throw MajikFileError.missingBinary();
     if (!this._signature?.trim()) {
       throw MajikFileError.invalidInput(
         "verifyBinary: this file has no attached signature",
@@ -2109,16 +1374,8 @@ export class MajikFile {
       );
     }
 
-    // Decrypting first proves the ciphertext is well-formed and the caller's
-    // identity actually has access — if this throws, the file is unusable
-    // regardless of signature validity, so let it propagate.
     await MajikFile.decrypt(this._binary, identity);
 
-    // Signature verification targets the encrypted binary — mirrors verify()
-    // and verifySignedMJKB(), and matches what sign() actually signs. This is
-    // what lets verification work without requiring decryption in those two
-    // call sites; verifyBinary() additionally proves the ciphertext decrypts
-    // cleanly, but checks the same signed artifact as everywhere else.
     if (MajikFile._isMajikKey(keyOrPublicKeys)) {
       return MajikSignature.verifyWithKey(this._binary, sig, keyOrPublicKeys);
     }
@@ -2126,27 +1383,9 @@ export class MajikFile {
   }
 
   /**
-   * Verify the MJKS trailer signature on a signed .mjkb binary in one call.
-   *
-   * This is the offline verification path — no Supabase or MajikFile instance
-   * needed. Pass the raw bytes downloaded from R2 (or shared directly) and the
-   * signer's public keys.
-   *
-   * Steps:
-   *  1. Check for a MJKS trailer — throws if none found
-   *  2. Extract the embedded MajikSignature from the trailer
-   *  3. Strip the trailer to recover the original .mjkb bytes
-   *  4. Verify the signature against those stripped bytes
-   *
-   * Note: this verifies the encrypted binary, not the plaintext. That is
-   * intentional — it proves the ciphertext hasn't been tampered with since
-   * signing, without requiring decryption. For plaintext verification use
-   * verifyBinary() on a loaded instance after decryption.
-   *
-   * @param source          Raw signed .mjkb bytes (Blob, Uint8Array, or ArrayBuffer).
-   * @param keyOrPublicKeys MajikKey instance (locked or unlocked) or raw public keys.
-   * @returns               VerificationResult with valid: true/false and envelope metadata.
-   * @throws MajikFileError if no MJKS trailer is found or the trailer is malformed.
+   * Verify the MJKS trailer signature on a signed .mjkb binary in one
+   * call — no database round-trip needed. Verifies the encrypted binary,
+   * not the plaintext (proves the ciphertext hasn't been tampered with).
    */
   static async verifySignedMJKB(
     source: Blob | Uint8Array | ArrayBuffer,
@@ -2177,11 +1416,8 @@ export class MajikFile {
 
   /**
    * Extract envelope metadata from the attached signature without full
-   * cryptographic verification. Useful for displaying signer info in a UI
-   * (e.g. "Signed by business@thezelijah.world on 2025-01-01") before deciding
-   * whether to run the more expensive verify() call.
-   *
-   * Returns null if no signature is attached or the stored value is malformed.
+   * cryptographic verification — for UI display before deciding whether
+   * to run the more expensive verify() call.
    */
   getSignatureInfo(): FileSignature | null {
     if (!this._signature?.trim()) return null;

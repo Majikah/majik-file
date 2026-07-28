@@ -1,32 +1,29 @@
-import { CompressionLevel } from "./compressor/majik-compressor";
-import type { MajikKey } from "@majikah/majik-key";
+/**
+ * core/types/base.ts
+ *
+ * Types for the base, platform-agnostic MajikFile. Nothing in here knows
+ * about chat, threads, R2, or any other Majikah-specific concept — that
+ * all lives in core/types/message.ts, layered on top via MajikMessageFile.
+ */
 
-export type MajikMessagePublicKey = string;
+import type { CompressionLevel } from "./compressor/majik-compressor";
+import type {
+  MajikKey,
+  MajikKeyAddress,
+  MajikKeyFingerprint,
+} from "@majikah/majik-key";
+import { CRYPTO_SUITE } from "./crypto/constants";
 
-// ─── Domain Types ─────────────────────────────────────────────────────────────
-
-export type FileContext =
-  | "user_upload"
-  | "chat_attachment"
-  | "chat_image"
-  | "chat_voice"
-  | "thread_attachment";
-
-export type StorageType = "permanent" | "temporary";
-
-/** Allowed TTLs for temporary files in days. Maps 1:1 to R2 lifecycle prefixes. */
-export type TempFileDuration = 1 | 2 | 3 | 5 | 7 | 15;
-
-// ─── Identities & Recipients ──────────────────────────────────────────────────
+// ─── Identities & Recipients ────────────────────────────────────────────────
 
 /**
- * The file owner's full identity.
- * Carries both keys — public for encryption, secret for decryption.
+ * The file owner's full identity. Carries both keys — public for
+ * encryption, secret for decryption.
  */
 export interface MajikFileIdentity {
-  publicKey: MajikMessagePublicKey;
+  publicKey: MajikKeyAddress;
   /** Base64 SHA-256 of the ML-KEM public key — used to look up key entries. */
-  fingerprint: string;
+  fingerprint: MajikKeyFingerprint;
   /** ML-KEM-768 public key (1184 bytes) — used during encryption. */
   mlKemPublicKey: Uint8Array;
   /** ML-KEM-768 secret key (2400 bytes) — used during decryption. */
@@ -34,17 +31,13 @@ export interface MajikFileIdentity {
 }
 
 /**
- * A recipient who can decrypt the file.
- * Carries only the public key — the secret key never leaves the recipient's device.
- *
- * In a single-recipient file, this is typically the owner themselves.
- * In a group file (e.g. a shared chat attachment), this is every participant
- * who should be able to download and decrypt the file.
+ * A recipient who can decrypt the file. Carries only the public key — the
+ * secret key never leaves the recipient's device.
  */
 export interface MajikFileRecipient {
   /** Base64 SHA-256 of the ML-KEM public key — used to locate the key entry on decrypt. */
-  fingerprint: string;
-  publicKey: MajikMessagePublicKey;
+  fingerprint: MajikKeyFingerprint;
+  publicKey: MajikKeyAddress;
   /** ML-KEM-768 public key (1184 bytes). */
   mlKemPublicKey: Uint8Array;
 }
@@ -52,27 +45,21 @@ export interface MajikFileRecipient {
 /**
  * Union accepted by every decrypt-related method on MajikFile (decrypt(),
  * decryptWithMetadata(), decryptBinary(), decryptHydrate(), verifyBinary(),
- * batchDecrypt()).
- *
- * Callers may pass either a full (unlocked) MajikKey instance, or the bare
- * minimal identity shape — whichever is more convenient at the call site.
- * MajikFile resolves either shape internally via a single private helper.
+ * batchDecrypt()). Callers may pass either a full (unlocked) MajikKey
+ * instance, or the bare minimal identity shape.
  */
 export type MajikFileDecryptIdentity =
   | MajikKey
   | Pick<MajikFileIdentity, "fingerprint" | "mlKemSecretKey">;
 
-// ─── Per-recipient key entry (group .mjkb) ────────────────────────────────────
+// ─── Per-recipient key entry (group .mjkb) ──────────────────────────────────
 
 /**
  * Per-recipient encrypted key entry stored inside a group .mjkb binary.
- * Mirrors MajikEnvelope's GroupKey but for file payloads.
- *
- * encryptedAesKey = groupAesKey XOR mlKemSharedSecret  (32-byte XOR one-time-pad)
+ * encryptedAesKey = groupAesKey XOR mlKemSharedSecret (32-byte XOR one-time-pad).
  */
 export interface MajikFileGroupKey {
-  /** Base64 SHA-256 fingerprint — identifies which recipient this entry belongs to. */
-  fingerprint: string;
+  fingerprint: MajikKeyFingerprint;
   /** Base64-encoded ML-KEM-768 ciphertext (1088 bytes) for this recipient. */
   mlKemCipherText: string;
   /** Base64-encoded 32-byte encrypted AES key (groupAesKey XOR sharedSecret). */
@@ -80,247 +67,188 @@ export interface MajikFileGroupKey {
 }
 
 // ─── .mjkb Payload Types ─────────────────────────────────────────────────────
+//
+// Two payload generations coexist so old binaries stay readable:
+//
+//   v1 (legacy, MJKB_VERSION_LEGACY): payload.c embedded the FileContext, and
+//     decrypt-time decompression was *inferred* from context + mime. That's
+//     a platform-specific heuristic living inside what should be a generic
+//     binary format — fixed in v2. `c` is typed as `string | null` here
+//     rather than FileContext, since the base layer doesn't know that type.
+//
+//   v2 (current, MJKB_VERSION): drops `c` entirely, adds an explicit `z`
+//     compression flag set once at encrypt time. Decrypt just reads it —
+//     no context lookup needed anywhere in the base decode path.
 
-/**
- * JSON payload embedded in a single-recipient .mjkb binary.
- * The ML-KEM shared secret is used directly as the AES-256-GCM key.
- */
-export interface MjkbSinglePayload {
-  /** Base64-encoded ML-KEM-768 ciphertext (1088 bytes). */
+export interface MjkbSinglePayloadV1 {
   mlKemCipherText: string;
-  /** Original filename (e.g. "photo.png"). Short key keeps the binary compact. */
   n: string | null;
-  /** Original MIME type (e.g. "image/png"). Short key keeps the binary compact. */
   m: string | null;
-  /** Usage context — determines downstream UX and access control. */
-  c: FileContext | null;
+  c: string | null;
 }
-
-/**
- * JSON payload embedded in a group .mjkb binary.
- * The file is encrypted once with a random AES key; each recipient gets their
- * own ML-KEM encapsulation of that AES key.
- */
-export interface MjkbGroupPayload {
-  /** Per-recipient key entries. */
+export interface MjkbGroupPayloadV1 {
   keys: MajikFileGroupKey[];
-  /** Original filename (e.g. "photo.png"). Short key keeps the binary compact. */
   n: string | null;
-  /** Original MIME type (e.g. "image/png"). Short key keeps the binary compact. */
   m: string | null;
-  /** Usage context — determines downstream UX and access control. */
-  c: FileContext | null;
+  c: string | null;
+}
+export type MjkbPayloadV1 = MjkbSinglePayloadV1 | MjkbGroupPayloadV1;
+
+export interface MjkbSinglePayloadV2 {
+  mlKemCipherText: string;
+  n: string | null;
+  m: string | null;
+  /** True if the plaintext was zstd-compressed before encryption. */
+  z: boolean;
+}
+export interface MjkbGroupPayloadV2 {
+  keys: MajikFileGroupKey[];
+  n: string | null;
+  m: string | null;
+  z: boolean;
+}
+export type MjkbPayloadV2 = MjkbSinglePayloadV2 | MjkbGroupPayloadV2;
+
+/** "Current" payload shape — what encodeMjkb() always produces going forward. */
+export type MjkbPayload = MjkbPayloadV2;
+
+/** Any payload shape decodeMjkb() might hand back, legacy or current. */
+export type AnyMjkbPayload = MjkbPayloadV1 | MjkbPayloadV2;
+
+export function isMjkbGroupPayload<T extends AnyMjkbPayload>(
+  p: T,
+): p is Extract<T, { keys: MajikFileGroupKey[] }> {
+  return "keys" in p && Array.isArray((p as { keys: unknown }).keys);
 }
 
-export type MjkbPayload = MjkbSinglePayload | MjkbGroupPayload;
-
-export function isMjkbGroupPayload(p: MjkbPayload): p is MjkbGroupPayload {
-  return "keys" in p && Array.isArray((p as MjkbGroupPayload).keys);
-}
-
-export function isMjkbSinglePayload(p: MjkbPayload): p is MjkbSinglePayload {
+export function isMjkbSinglePayload<T extends AnyMjkbPayload>(
+  p: T,
+): p is Exclude<T, { keys: MajikFileGroupKey[] }> {
   return "mlKemCipherText" in p && !("keys" in p);
 }
 
-// ─── MajikFileJSON ────────────────────────────────────────────────────────────
-
-/**
- * Serialised representation of a MajikFile.
- * Maps 1-to-1 with the `majikah.majik_files` Supabase table.
- *
- * NOTE: The encrypted binary (_binary) is intentionally excluded — it lives
- * in R2 storage, not in Supabase.
- *
- * NOTE: encryption_iv is stored here as a hex string matching Supabase's `bytea`
- * column. The IV is also embedded in the .mjkb binary header, so decryption
- * uses the binary — this column exists for audit / key-rotation purposes.
- */
-export interface MajikFileJSON {
-  /** UUID primary key — matches gen_random_uuid() from Supabase. */
-  id: string;
-  /** auth.users UUID of the file owner. */
-  user_id: string;
-  /** R2 object key — unique path within the bucket. */
-  r2_key: string;
-  /** Original filename supplied by the uploader (e.g. "resume.pdf"). */
-  original_name: string | null;
-  /** MIME type (e.g. "application/pdf", "image/png"). */
-  mime_type: string | null;
-  /** Byte length of the raw plaintext file before compression or encryption. */
-  size_original: number;
-  /** Byte length of the final encrypted .mjkb binary stored in R2. */
-  size_stored: number;
-  /**
-   * SHA-256 hex digest of the original raw bytes (pre-compression).
-   * Used for duplicate detection across the user's files.
-   */
-  file_hash: string;
-  /**
-   * Hex-encoded 12-byte AES-GCM IV, matching Supabase `bytea` storage.
-   * This is a secondary record for audit/key-rotation; decryption reads the
-   * IV from the .mjkb binary header where it is authoritative.
-   */
-  encryption_iv: string;
-  /** Whether this file is permanently retained or auto-deleted after expiry. */
-  storage_type: StorageType;
-  /** Whether the file can be shared via share_token. */
-  is_shared: boolean;
-  /** Opaque token for shareable public links. */
-  share_token: string | null;
-  /** Usage context — determines downstream UX and access control. */
-  context: FileContext | null;
-  /** Foreign key → majik_message_chat.id. */
-  chat_message_id: string | null;
-  /** Foreign key → majik_message_mail.id. */
-  thread_message_id: string | null;
-  /** Foreign key → majik_message_thread.id. */
-  thread_id: string | null;
-
-  participants: MajikMessagePublicKey[];
-  /**
-   * Conversation (channel / DM) ID.
-   * Required when context is "chat_image" — used to scope the R2 key:
-   *   images/chats/<conversationId>/<userId>_<fileHash>.mjkb
-   * Null for all other contexts.
-   */
-  conversation_id: string | null;
-  /** ISO-8601 expiry timestamp. Required for temporary files. */
-  expires_at: string | null;
-  /** ISO-8601 creation timestamp. */
-  timestamp: string | null;
-  /** ISO-8601 last-update timestamp. Updated on any mutation (e.g. toggleSharing). */
-  last_update: string | null;
-
-  // MajikFileJSON
-  signature: string | null; // base64 — MajikSignature.serialize() output
+/** True if this payload is the v2 shape (has the explicit compression flag). */
+export function hasCompressionFlag(p: AnyMjkbPayload): p is MjkbPayloadV2 {
+  return "z" in p;
 }
 
-// ─── CreateOptions ────────────────────────────────────────────────────────────
-
-export interface CreateOptions {
-  /** Raw binary content of the file to encrypt. */
-  data: Uint8Array | ArrayBuffer;
-  /** UUID from auth.users — used for R2 key construction and ownership checks. */
-  userId: string;
-  /**
-   * Identity of the file owner.
-   * For single-recipient files, this is the only recipient (self-encryption).
-   * For group files, this is the sender — additional recipients are supplied
-   * via the `recipients` array.
-   */
-  identity: MajikFileIdentity;
-  /**
-   * Additional recipients beyond the owner.
-   * When provided (length ≥ 1), a group .mjkb is produced: the file is
-   * encrypted once with a random AES key and each recipient (including the
-   * owner, automatically prepended) gets their own ML-KEM key entry.
-   * When omitted or empty, a single-recipient .mjkb is produced.
-   */
-  recipients?: MajikFileRecipient[];
-  /** File context — affects storage routing and downstream UX. */
-  context: FileContext;
-  /** Original filename (e.g. "photo.jpg"). Optional but recommended. */
-  originalName?: string;
-  /** MIME type string (e.g. "image/jpeg"). Optional. */
-  mimeType?: string;
-  /**
-   * If true, the file is stored under files/public/ and auto-deleted
-   * by the bucket lifecycle policy after ~15 days.
-   * Requires expiresAt to be set.
-   * @default false
-   */
-  isTemporary?: boolean;
-  /**
-   * If true, a share_token can be generated to allow public access.
-   * @default false
-   */
-  isShared?: boolean;
-  /**
-   * Pre-computed UUID for the record. If omitted, a new UUID is generated.
-   */
-  id?: string;
-  /**
-   * Bypass the MAX_FILE_SIZE_BYTES (100 MB) limit.
-   * @default false
-   */
-  bypassSizeLimit?: boolean;
-  /**
-   * Temporary file duration in days. Required when isTemporary = true.
-   */
-  expiresAt?: TempFileDuration;
-  /** Associate this file with a chat message. */
-  chatMessageId?: string;
-  /** Associate this file with a thread message. */
-  threadMessageId?: string;
-  /** Associate this file with a thread. */
-  threadId?: string;
-  /**
-   * Conversation (channel / DM) ID.
-   * Required when context is "chat_image".
-   * Determines the R2 key prefix: images/chats/<conversationId>/
-   */
-  conversationId?: string;
-  /**
-   * Zstd compression level or preset for this file.
-   *
-   * Accepts either a raw integer (`CompressionLevel` 1–22) or a named
-   * `CompressionPreset` value. The level is always run through
-   * `MajikCompressor.adaptiveLevel()` before use, so it will be silently
-   * clamped downward for large files to avoid WASM out-of-memory errors.
-   *
-   * Defaults to ZSTD_MAX_LEVEL (22) when omitted — existing behaviour.
-   *
-   * @example
-   * // Raw integer
-   * compressionLevel: 9
-   *
-   * // Named preset
-   * compressionLevel: CompressionPreset.GOOD  // 9
-   * compressionLevel: CompressionPreset.BALANCED // 6
-   */
-  compressionLevel?: CompressionLevel | number;
-}
-
-// ─── Decoded .mjkb Binary ─────────────────────────────────────────────────────
+// ─── Decoded .mjkb Binary ────────────────────────────────────────────────────
 
 /**
- * Internal representation of a fully parsed .mjkb binary.
- * The payload JSON (single or group) is embedded after the IV.
+ * Internal representation of a fully parsed .mjkb binary. `version` drives
+ * dispatch between the v1 legacy decode/decompress path and the v2 current
+ * one — see decodeMjkb() in majik-file.ts.
  */
 export interface DecodedMjkb {
   version: number;
   /** IV extracted from the binary header — authoritative source for decryption. */
   iv: Uint8Array;
-  /** AES-GCM ciphertext (Zstd-compressed plaintext + 16-byte auth tag). */
+  /** AES-GCM ciphertext (compressed plaintext, if applicable + 16-byte auth tag). */
   ciphertext: Uint8Array;
-  /** Parsed payload — discriminate with isMjkbGroupPayload / isMjkbSinglePayload. */
-  payload: MjkbPayload;
+  payload: AnyMjkbPayload;
+}
+
+// ─── Record schema / kind ────────────────────────────────────────────────────
+
+/**
+ * Discriminator for polymorphic reads. Base MajikFile is "file"; every
+ * subclass declares its own literal (e.g. MajikMessageFile → "message_file")
+ * so a shared loader can route to the right class without knowing about
+ * subclasses ahead of time.
+ */
+export type MajikFileKind = "file";
+
+// ─── MajikFileJSON ────────────────────────────────────────────────────────────
+
+/**
+ * Serialised representation of the base MajikFile. Contains only what's
+ * needed to identify, describe, and decrypt the file — no storage/platform
+ * fields. NOTE: the encrypted binary (_binary) is intentionally excluded;
+ * it's a separate artifact (R2, disk, IndexedDB — base doesn't care).
+ */
+export interface MajikFileJSON {
+  id: string;
+  /**
+   * Record schema version (see FILE_SCHEMA_VERSION). Always present on
+   * records produced by this SDK. Legacy rows never had this field at
+   * all — MajikFile.isLegacyJSON() checks for its absence.
+   */
+  schema_version: number;
+  kind: MajikFileKind;
+  /** Owner's user id. Ownership is a generic concept; kept in the base. */
+  user_id: string;
+  original_name: string | null;
+  mime_type: string | null;
+  /** Byte length of the raw plaintext before compression/encryption. */
+  size_original: number;
+  /** Byte length of the final encrypted .mjkb binary. */
+  size_stored: number;
+  /** SHA-256 hex digest of the original raw bytes (pre-compression) — dedup key. */
+  file_hash: string;
+  /**
+   * Hex-encoded 12-byte AES-GCM IV — secondary record for audit/key-rotation;
+   * decryption reads the authoritative IV from the .mjkb binary header.
+   */
+  encryption_iv: string;
+  participants: MajikKeyAddress[];
+  /** Self-describing crypto suite — see CRYPTO_SUITE. */
+  kem_alg: string;
+  cipher_alg: string;
+  timestamp: string | null;
+  last_update: string | null;
+  /** base64 — MajikSignature.serialize() output. */
+  signature: string | null;
+}
+
+/** Convenience default used when stamping new records. */
+export const DEFAULT_CRYPTO_SUITE_FIELDS = {
+  kem_alg: CRYPTO_SUITE.kemAlg,
+  cipher_alg: CRYPTO_SUITE.cipherAlg,
+} as const;
+
+// ─── CreateOptions ────────────────────────────────────────────────────────────
+
+export interface MajikFileCreateOptions {
+  /** Raw binary content of the file to encrypt. */
+  data: Uint8Array | ArrayBuffer;
+  /** Owner user id — used for ownership checks. */
+  userId: string;
+  /**
+   * Identity of the file owner. For single-recipient files this is the
+   * only recipient (self-encryption); for group files this is the sender.
+   */
+  identity: MajikFileIdentity;
+  /**
+   * Additional recipients beyond the owner. When provided (length ≥ 1),
+   * a group .mjkb is produced. When omitted/empty, single-recipient.
+   */
+  recipients?: MajikFileRecipient[];
+  originalName?: string;
+  mimeType?: string;
+  /** Pre-computed UUID for the record. If omitted, a new UUID is generated. */
+  id?: string;
+  /** Bypass the MAX_FILE_SIZE_BYTES limit. @default false */
+  bypassSizeLimit?: boolean;
+  /**
+   * Zstd compression level or preset. Always run through
+   * MajikCompressor.adaptiveLevel() before use. Defaults to the max level.
+   */
+  compressionLevel?: CompressionLevel | number;
 }
 
 // ─── File Stats ───────────────────────────────────────────────────────────────
 
-/**
- * Human-readable stats returned by MajikFile.getStats().
- */
+/** Human-readable stats returned by MajikFile.getStats(). */
 export interface MajikFileStats {
   id: string;
   originalName: string | null;
   mimeType: string | null;
-  /** Human-readable original size (e.g. "4.2 MB") */
   sizeOriginalHuman: string;
-  /** Human-readable stored size (e.g. "1.1 MB") */
   sizeStoredHuman: string;
-  /** Compression ratio as a percentage reduction (e.g. 73.4). Clamped to 0 minimum. */
+  /** Compression ratio as a percentage reduction. Clamped to 0 minimum. */
   compressionRatioPct: number;
   fileHash: string;
-  storageType: StorageType;
   isGroup: boolean;
-  context: FileContext | null;
-  isShared: boolean;
-  isExpired: boolean;
-  expiresAt: string | null;
-  timestamp: string | null;
-  r2Key: string;
   isSigned: boolean;
 }
 

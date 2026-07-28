@@ -6,6 +6,10 @@
  *
  * All operations are synchronous except where noted.
  * Random bytes are sourced from crypto.getRandomValues().
+ *
+ * Unchanged from the pre-refactor SDK — these primitives were already
+ * platform-agnostic and need no changes for the MajikFile/MajikMessageFile
+ * split.
  */
 
 import { AES } from "@stablelib/aes";
