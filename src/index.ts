@@ -10,4 +10,5 @@ export {
   encodeMjkb,
   decodeMjkb,
   resolveAesKeyFromPayload,
+  MJKB_MAGIC,
 } from "./core/mjkb-codec";

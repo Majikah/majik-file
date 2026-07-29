@@ -25,7 +25,7 @@ import { arrayToBase64, base64ToArray } from "./utils";
 import { isMjkbGroupPayload, isMjkbSinglePayload } from "./types";
 import type { AnyMjkbPayload, MjkbPayload, DecodedMjkb } from "./types";
 
-const MJKB_MAGIC = [0x4d, 0x4a, 0x4b, 0x42]; // "MJKB"
+export const MJKB_MAGIC = [0x4d, 0x4a, 0x4b, 0x42]; // "MJKB"
 
 // ─── Encode ───────────────────────────────────────────────────────────────────
 
