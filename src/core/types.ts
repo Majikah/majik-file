@@ -128,7 +128,9 @@ export function isMjkbSinglePayload<T extends AnyMjkbPayload>(
 }
 
 /** True if this payload is the v2 shape (has the explicit compression flag). */
-export function hasCompressionFlag(p: AnyMjkbPayload): p is MjkbPayloadV2 {
+export function hasCompressionFlag(
+  p: AnyMjkbPayload,
+): p is MjkbPayloadV2 {
   return "z" in p;
 }
 
@@ -151,10 +153,14 @@ export interface DecodedMjkb {
 // ─── Record schema / kind ────────────────────────────────────────────────────
 
 /**
- * Discriminator for polymorphic reads. Base MajikFile is "file"; every
- * subclass declares its own literal (e.g. MajikMessageFile → "message_file")
- * so a shared loader can route to the right class without knowing about
- * subclasses ahead of time.
+ * Discriminator for polymorphic reads. Base MajikFile always stamps "file"
+ * on records it creates directly; it's exported here as a named constant
+ * for that purpose. The JSON field itself (MajikFileJSON.kind, below) is
+ * typed as plain `string` rather than this literal — that's deliberate:
+ * it lets MajikMessageFileJSON (and any future subclass JSON type) declare
+ * its own narrower literal ("message_file", etc.) while still being
+ * structurally assignable to MajikFileJSON when a subclass constructor
+ * calls super(json, ...).
  */
 export type MajikFileKind = "file";
 
@@ -174,7 +180,8 @@ export interface MajikFileJSON {
    * all — MajikFile.isLegacyJSON() checks for its absence.
    */
   schema_version: number;
-  kind: MajikFileKind;
+  /** "file" on base records; subclasses stamp their own literal (e.g. "message_file"). */
+  kind: string;
   /** Owner's user id. Ownership is a generic concept; kept in the base. */
   user_id: string;
   original_name: string | null;

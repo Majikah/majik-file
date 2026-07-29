@@ -14,7 +14,7 @@ import {
   MJKS_OVERHEAD,
   MJKS_MAGIC_LEN,
   MJKS_MAGIC,
-  MJKB_VERSION,
+
 } from "./core/crypto/constants";
 import { MajikFileError } from "./core/error";
 import { MajikFileValidator } from "./core/validator";
@@ -164,6 +164,16 @@ export interface EncryptCoreInput {
   mimeType: string | null;
   bypassSizeLimit: boolean;
   compressionLevel?: number;
+  /**
+   * Opaque passthrough to `_preProcess()`. Base ignores it entirely. A
+   * subclass that overrides `_preProcess()` and needs extra platform data
+   * to decide how to preprocess (e.g. MajikMessageFile needs FileContext
+   * to decide whether to convert an image to WebP) passes it here and
+   * casts it back inside its own override. Kept as `unknown` rather than
+   * a generic type parameter to avoid threading generics through the
+   * entire static method hierarchy for a single, rarely-needed hook.
+   */
+  preProcessExtra?: unknown;
 }
 
 export class MajikFile {
@@ -171,7 +181,7 @@ export class MajikFile {
 
   protected readonly _id: string;
   protected readonly _schemaVersion: number;
-  protected readonly _kind: MajikFileKind;
+  protected readonly _kind: string;
   protected readonly _userId: string;
   protected readonly _originalName: string | null;
   protected readonly _mimeType: string | null;
@@ -244,7 +254,7 @@ export class MajikFile {
   get schemaVersion(): number {
     return this._schemaVersion;
   }
-  get kind(): MajikFileKind {
+  get kind(): string {
     return this._kind;
   }
   get userId(): string {
@@ -351,6 +361,7 @@ export class MajikFile {
   protected static async _preProcess(
     raw: Uint8Array,
     mimeType: string | null,
+    _extra?: unknown,
   ): Promise<{ bytes: Uint8Array; mimeType: string | null }> {
     return { bytes: raw, mimeType };
   }
@@ -417,7 +428,7 @@ export class MajikFile {
       const fileHash = sha256Hex(raw);
 
       const { bytes: processedBytes, mimeType: resolvedMimeType } =
-        await this._preProcess(raw, input.mimeType);
+        await this._preProcess(raw, input.mimeType, input.preProcessExtra);
 
       const compress = this._resolveCompressionPolicy(resolvedMimeType);
       const compressed = compress
@@ -919,6 +930,24 @@ export class MajikFile {
    * @param json   MajikFileJSON — must carry schema_version FILE_SCHEMA_VERSION or lower.
    * @param binary Optional encrypted .mjkb bytes.
    */
+  /**
+   * Peek at a binary's payload (if provided) to detect single vs group
+   * mode. Shared by fromJSON() here and in every subclass's own fromJSON()
+   * override, so this parsing logic exists exactly once.
+   */
+  protected static _detectIsGroupFromBinary(
+    binaryBytes: Uint8Array | null,
+  ): boolean {
+    if (!binaryBytes) return false;
+    try {
+      const { payload } = decodeMjkb(binaryBytes);
+      return isMjkbGroupPayload(payload);
+    } catch {
+      // Binary is malformed — let validate() / downstream use catch it.
+      return false;
+    }
+  }
+
   static fromJSON(
     json: MajikFileJSON,
     binary?: Uint8Array | ArrayBuffer | null,
@@ -934,16 +963,7 @@ export class MajikFile {
     );
 
     const binaryBytes = binary != null ? normaliseToUint8Array(binary) : null;
-
-    let isGroup = false;
-    if (binaryBytes) {
-      try {
-        const { payload } = decodeMjkb(binaryBytes);
-        isGroup = isMjkbGroupPayload(payload);
-      } catch {
-        // Binary is malformed — let validate() / downstream use catch it.
-      }
-    }
+    const isGroup = MajikFile._detectIsGroupFromBinary(binaryBytes);
 
     const instance = new MajikFile(json, binaryBytes, isGroup);
     instance.validate();
@@ -1049,12 +1069,13 @@ export class MajikFile {
   // ── VALIDATE ──────────────────────────────────────────────────────────────
 
   /**
-   * Validate all required base properties. Collects ALL errors before
-   * throwing so the full list is visible at once. Subclasses call this via
-   * super.validate() equivalent (MajikMessageFileValidator rules) and add
-   * their own — see MajikMessageFile.validate().
+   * Collects (without throwing) every base-level validation error. Exposed
+   * as `protected` so MajikMessageFile.validate() can call
+   * `super._collectErrors()`, append its own context/storage errors, and
+   * throw exactly once with the full combined list — rather than the base
+   * and subclass validating in two separate throwing passes.
    */
-  validate(): void {
+  protected _collectErrors(): string[] {
     const errors: string[] = [];
     const push = (err: string | null) => {
       if (err) errors.push(err);
@@ -1080,7 +1101,16 @@ export class MajikFile {
       ),
     );
 
-    MajikFileValidator.assertAll(errors);
+    return errors;
+  }
+
+  /**
+   * Validate all required base properties, throwing once with every error
+   * found. Subclasses override this to combine `super._collectErrors()`
+   * with their own rules — see MajikMessageFile.validate().
+   */
+  validate(): void {
+    MajikFileValidator.assertAll(this._collectErrors());
   }
 
   // ── OWNERSHIP ─────────────────────────────────────────────────────────────
@@ -1437,7 +1467,3 @@ export class MajikFile {
     }
   }
 }
-
-// Freeze static and instance methods
-Object.freeze(MajikFile);
-Object.freeze(MajikFile.prototype);
