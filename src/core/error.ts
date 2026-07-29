@@ -135,3 +135,7 @@ export class MajikFileError extends Error {
     return new MajikFileError("STORAGE_KEY_MISMATCH", message);
   }
 }
+
+// Freeze static and instance methods
+Object.freeze(MajikFileError);
+Object.freeze(MajikFileError.prototype);

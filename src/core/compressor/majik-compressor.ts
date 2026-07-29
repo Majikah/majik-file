@@ -279,3 +279,4 @@ export class MajikCompressor {
     return Math.max(0, Math.round(reduction * 10) / 10);
   }
 }
+

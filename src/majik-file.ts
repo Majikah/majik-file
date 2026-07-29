@@ -806,12 +806,13 @@ export class MajikFile {
 
   /**
    * Decrypt an array of MajikFile (or subclass) instances concurrently.
-   * Always attempts to hydrate/unlock the file directly. Files that cannot be
-   * decrypted are collected in `errors` and excluded from `decrypted`.
+   * Files that cannot be decrypted with the provided key are collected in
+   * `errors` and excluded from `decrypted`. Generic over T so subclass
+   * arrays (e.g. MajikMessageFile[]) keep their type through the batch.
    */
   static async batchDecrypt<T extends MajikFile>(
     files: T[],
-    key: MajikKey | MajikFileDecryptIdentity,
+    key: MajikKey,
   ): Promise<BatchDecryptResult<T>> {
     MajikFile._resolveDecryptIdentity(key);
 
@@ -820,8 +821,11 @@ export class MajikFile {
     const results = await Promise.allSettled(
       files.map(async (file) => {
         if (file.hasDecryptedFile) return file;
-
-        // Removed the canDecrypt check — always attempt to unlock
+        if (!file.canDecrypt(key)) {
+          throw new Error(
+            `Key "${key.fingerprint}" is not a participant of this file.`,
+          );
+        }
         await file.decryptHydrate(key);
         return file;
       }),
@@ -1123,7 +1127,6 @@ export class MajikFile {
         "hasPublicKeyAccess: ownerFingerprint is required",
       );
     }
-
     return sha256Base64(publicKey) === ownerFingerprint;
   }
 
@@ -1434,3 +1437,7 @@ export class MajikFile {
     }
   }
 }
+
+// Freeze static and instance methods
+Object.freeze(MajikFile);
+Object.freeze(MajikFile.prototype);

@@ -184,3 +184,7 @@ export class MajikFileValidator {
     return a && b ? `${labelA} and ${labelB} cannot both be set` : null;
   }
 }
+
+// Freeze static and instance methods
+Object.freeze(MajikFileValidator);
+Object.freeze(MajikFileValidator.prototype);
