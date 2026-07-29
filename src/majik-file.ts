@@ -14,7 +14,6 @@ import {
   MJKS_OVERHEAD,
   MJKS_MAGIC_LEN,
   MJKS_MAGIC,
-
 } from "./core/crypto/constants";
 import { MajikFileError } from "./core/error";
 import { MajikFileValidator } from "./core/validator";
@@ -817,13 +816,12 @@ export class MajikFile {
 
   /**
    * Decrypt an array of MajikFile (or subclass) instances concurrently.
-   * Files that cannot be decrypted with the provided key are collected in
-   * `errors` and excluded from `decrypted`. Generic over T so subclass
-   * arrays (e.g. MajikMessageFile[]) keep their type through the batch.
+   * Always attempts to hydrate/unlock the file directly. Files that cannot be
+   * decrypted are collected in `errors` and excluded from `decrypted`.
    */
   static async batchDecrypt<T extends MajikFile>(
     files: T[],
-    key: MajikKey,
+    key: MajikKey | MajikFileDecryptIdentity,
   ): Promise<BatchDecryptResult<T>> {
     MajikFile._resolveDecryptIdentity(key);
 

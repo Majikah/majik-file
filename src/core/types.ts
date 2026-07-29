@@ -128,9 +128,7 @@ export function isMjkbSinglePayload<T extends AnyMjkbPayload>(
 }
 
 /** True if this payload is the v2 shape (has the explicit compression flag). */
-export function hasCompressionFlag(
-  p: AnyMjkbPayload,
-): p is MjkbPayloadV2 {
+export function hasCompressionFlag(p: AnyMjkbPayload): p is MjkbPayloadV2 {
   return "z" in p;
 }
 
