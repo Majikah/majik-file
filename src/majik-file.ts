@@ -49,7 +49,6 @@ import type {
   AnyMjkbPayload,
   MajikFileStats,
   MajikFileDecryptIdentity,
-  MajikFileKind,
   FileSignature,
 } from "./core/types";
 import {

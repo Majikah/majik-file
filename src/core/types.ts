@@ -11,6 +11,7 @@ import type {
   MajikKey,
   MajikKeyAddress,
   MajikKeyFingerprint,
+  MLKEM768RawPublicKey,
 } from "@majikah/majik-key";
 import { CRYPTO_SUITE } from "./crypto/constants";
 
@@ -25,7 +26,7 @@ export interface MajikFileIdentity {
   /** Base64 SHA-256 of the ML-KEM public key — used to look up key entries. */
   fingerprint: MajikKeyFingerprint;
   /** ML-KEM-768 public key (1184 bytes) — used during encryption. */
-  mlKemPublicKey: Uint8Array;
+  mlKemPublicKey: MLKEM768RawPublicKey;
   /** ML-KEM-768 secret key (2400 bytes) — used during decryption. */
   mlKemSecretKey: Uint8Array;
 }
@@ -39,7 +40,7 @@ export interface MajikFileRecipient {
   fingerprint: MajikKeyFingerprint;
   publicKey: MajikKeyAddress;
   /** ML-KEM-768 public key (1184 bytes). */
-  mlKemPublicKey: Uint8Array;
+  mlKemPublicKey: MLKEM768RawPublicKey;
 }
 
 /**
