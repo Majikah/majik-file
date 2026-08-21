@@ -22,10 +22,33 @@ import { MajikFileError } from "./error";
 import { mlKemDecapsulate } from "./crypto/crypto-provider";
 import { withZeroize } from "./crypto/zeroize";
 import { arrayToBase64, base64ToArray } from "./utils";
-import { isMjkbGroupPayload, isMjkbSinglePayload } from "./types";
-import type { AnyMjkbPayload, MjkbPayload, DecodedMjkb } from "./types";
+
+import type {
+  AnyMjkbPayload,
+  MjkbPayload,
+  DecodedMjkb,
+  MajikFileGroupKey,
+  MjkbPayloadV2,
+} from "./types";
 
 export const MJKB_MAGIC = [0x4d, 0x4a, 0x4b, 0x42]; // "MJKB"
+
+export function isMjkbGroupPayload<T extends AnyMjkbPayload>(
+  p: T,
+): p is Extract<T, { keys: MajikFileGroupKey[] }> {
+  return "keys" in p && Array.isArray((p as { keys: unknown }).keys);
+}
+
+export function isMjkbSinglePayload<T extends AnyMjkbPayload>(
+  p: T,
+): p is Exclude<T, { keys: MajikFileGroupKey[] }> {
+  return "mlKemCipherText" in p && !("keys" in p);
+}
+
+/** True if this payload is the v2 shape (has the explicit compression flag). */
+export function hasCompressionFlag(p: AnyMjkbPayload): p is MjkbPayloadV2 {
+  return "z" in p;
+}
 
 // ─── Encode ───────────────────────────────────────────────────────────────────
 

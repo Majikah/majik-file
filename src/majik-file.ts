@@ -38,7 +38,7 @@ import {
   resolveAesKeyFromPayload,
 } from "./core/mjkb-codec";
 import { MajikCompressor } from "./core/compressor/majik-compressor";
-import { isMjkbGroupPayload, hasCompressionFlag } from "./core/types";
+import { isMjkbGroupPayload, hasCompressionFlag } from "./core/mjkb-codec";
 import type {
   MajikFileJSON,
   MajikFileCreateOptions,
@@ -1461,6 +1461,50 @@ export class MajikFile {
       };
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * Check if a given identity can decrypt a raw .mjkb binary without
+   * instantiating a full MajikFile.
+   *
+   * @param source Raw .mjkb source (Blob, Uint8Array, or ArrayBuffer)
+   * @param identity Full identity (for crypto check) or fingerprint object (for group fast-check)
+   * @param options.strict If true, forces full trial decryption even on group match. Default: false.
+   */
+  static async canDecryptMJKB(
+    source: Blob | Uint8Array | ArrayBuffer,
+    identity: MajikFileDecryptIdentity | { fingerprint: string },
+    options: { strict?: boolean } = {},
+  ): Promise<boolean> {
+    try {
+      const raw = MajikFile.stripMjksTrailer(
+        await normaliseToUint8ArrayAsync(source),
+      );
+      const { payload } = decodeMjkb(raw);
+
+      // 1. Group File Fast Path: Check fingerprint in payload.keys
+      if (isMjkbGroupPayload(payload)) {
+        const isParticipant = payload.keys.some(
+          (k) => k.fingerprint === identity.fingerprint,
+        );
+
+        if (!isParticipant) return false;
+
+        // If found and not in strict mode, return true without running ML-KEM/AES
+        if (!options.strict) return true;
+      }
+
+      // 2. Single File or Strict Check: Requires full ML-KEM + AES trial decrypt
+      if ("mlKemSecretKey" in identity) {
+        await MajikFile._decryptCore(raw, identity as MajikFileDecryptIdentity);
+        return true;
+      }
+
+      // If single-recipient and no secret key was provided, we cannot verify cryptographically
+      return false;
+    } catch {
+      return false;
     }
   }
 }

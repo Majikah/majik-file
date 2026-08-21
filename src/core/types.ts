@@ -116,23 +116,6 @@ export type MjkbPayload = MjkbPayloadV2;
 /** Any payload shape decodeMjkb() might hand back, legacy or current. */
 export type AnyMjkbPayload = MjkbPayloadV1 | MjkbPayloadV2;
 
-export function isMjkbGroupPayload<T extends AnyMjkbPayload>(
-  p: T,
-): p is Extract<T, { keys: MajikFileGroupKey[] }> {
-  return "keys" in p && Array.isArray((p as { keys: unknown }).keys);
-}
-
-export function isMjkbSinglePayload<T extends AnyMjkbPayload>(
-  p: T,
-): p is Exclude<T, { keys: MajikFileGroupKey[] }> {
-  return "mlKemCipherText" in p && !("keys" in p);
-}
-
-/** True if this payload is the v2 shape (has the explicit compression flag). */
-export function hasCompressionFlag(p: AnyMjkbPayload): p is MjkbPayloadV2 {
-  return "z" in p;
-}
-
 // ─── Decoded .mjkb Binary ────────────────────────────────────────────────────
 
 /**

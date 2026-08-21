@@ -59,15 +59,10 @@
     "@majikah/majik-signature": "^0.3.0",
     "@noble/post-quantum": "^0.7.0",
     "@stablelib/aes": "^2.0.1",
-    "@stablelib/ed25519": "^2.0.2",
     "@stablelib/gcm": "^2.0.1",
-    "@stablelib/pbkdf2": "^2.0.1",
-    "@stablelib/sha256": "^2.0.1",
-    "@stablelib/x25519": "^2.0.1",
-    "ed2curve": "^0.3.0"
+    "@stablelib/sha256": "^2.0.1"
   },
   "devDependencies": {
-    "@types/ed2curve": "^0.2.4",
     "@types/node": "^26.2.0",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11"

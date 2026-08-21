@@ -16,7 +16,10 @@ import {
 import { MajikFile } from "../src/majik-file";
 import { MajikFileError } from "../src/core/error";
 
-import { isMjkbGroupPayload, isMjkbSinglePayload } from "../src/core/types";
+import {
+  isMjkbGroupPayload,
+  isMjkbSinglePayload,
+} from "../src/core/mjkb-codec";
 import type {
   MajikFileIdentity,
   MajikFileRecipient,
@@ -357,6 +360,7 @@ describe("MajikFile Class Unit Tests", () => {
 
         const { payload } = decodeMjkb(groupFile.toBinaryBytes());
         expect(isMjkbGroupPayload(payload)).toBe(true);
+
         if (isMjkbGroupPayload(payload)) {
           expect(payload.keys).toHaveLength(2); // owner + bob
         }

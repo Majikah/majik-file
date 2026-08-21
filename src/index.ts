@@ -6,9 +6,4 @@ export * from "./majik-file";
 export * from "./core/error";
 export * from "./core/validator";
 
-export {
-  encodeMjkb,
-  decodeMjkb,
-  resolveAesKeyFromPayload,
-  MJKB_MAGIC,
-} from "./core/mjkb-codec";
+export * from "./core/mjkb-codec";
