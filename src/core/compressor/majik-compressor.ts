@@ -15,6 +15,8 @@ import {
   decompress as zstdDecompress,
 } from "@bokuweb/zstd-wasm";
 import { MajikFileError } from "../error";
+import { COMPRESSION_SUITE } from "../crypto/constants";
+import type { CompressionCodec } from "../types";
 
 /** Maximum Zstd compression level (highest ratio, slowest). */
 export const ZSTD_MAX_LEVEL = 22;
@@ -280,3 +282,24 @@ export class MajikCompressor {
   }
 }
 
+// ─── Default codec (zstd) ───────────────────────────────────────────────────
+
+/**
+ * Wraps MajikCompressor as a CompressionCodec so the built-in zstd path
+ * can be passed through exactly the same pluggable interface a custom
+ * codec would use.
+ *
+ * This is the implicit default in _encryptCore()/_decryptCore() whenever
+ * no custom `compressor` (encrypt) or matching entry in `compressors`
+ * (decrypt) is supplied or found for a given `alg` — every pre-existing
+ * call site keeps using exactly this, unchanged.
+ *
+ * `alg` is sourced from COMPRESSION_SUITE rather than hardcoded here, so
+ * the single source of truth for "what does an absent ca/compression_alg
+ * mean" stays in constants.ts alongside CRYPTO_SUITE.
+ */
+export const ZSTD_CODEC: CompressionCodec = {
+  alg: COMPRESSION_SUITE.alg,
+  compress: (bytes, level) => MajikCompressor.compress(bytes, level),
+  decompress: (bytes) => MajikCompressor.decompress(bytes),
+};

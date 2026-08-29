@@ -13,7 +13,46 @@ import type {
   MajikKeyFingerprint,
   MLKEM768RawPublicKey,
 } from "@majikah/majik-key";
-import { CRYPTO_SUITE } from "./crypto/constants";
+import { CRYPTO_SUITE, COMPRESSION_SUITE } from "./crypto/constants";
+
+// ─── Compression Codec (pluggable compression) ─────────────────────────────
+
+/**
+ * Pluggable compression implementation. When supplied to create() (as
+ * `compressor`), replaces the built-in MajikCompressor/zstd for that one
+ * encryption. `alg` is stamped into both the .mjkb payload (`ca` field —
+ * added in a follow-up step) and the JSON record (`compression_alg` —
+ * also a follow-up step) so a file compressed with a custom codec is
+ * self-describing on both the wire and the row, the same way CRYPTO_SUITE
+ * makes kem_alg/cipher_alg self-describing.
+ *
+ * Omitting `compressor` on create() defaults to ZSTD_CODEC (see
+ * majik-compressor.ts) — every existing call site is unaffected.
+ *
+ * `alg` must be stable for a given codec's output: it's the key used to
+ * look the same codec back up on decrypt (see DecryptCompressionOptions).
+ */
+export interface CompressionCodec {
+  /** Identifier stamped into payload.ca / json.compression_alg (e.g. "zstd", "brotli", "my-custom-alg"). */
+  alg: string;
+  compress(
+    bytes: Uint8Array,
+    level?: CompressionLevel | number,
+  ): Promise<Uint8Array> | Uint8Array;
+  decompress(bytes: Uint8Array): Promise<Uint8Array> | Uint8Array;
+}
+
+/**
+ * Optional bag accepted by every decrypt-family method (decrypt(),
+ * decryptWithMetadata(), decryptBinary(), decryptHydrate(), verifyBinary(),
+ * batchDecrypt(), canDecryptMJKB()). The built-in zstd codec is always
+ * tried first and needs no entry here — `compressors` is only consulted
+ * when a payload's `ca` names something else. An unmatched non-zstd `ca`
+ * throws MajikFileError.unsupportedCompressionAlg().
+ */
+export interface DecryptCompressionOptions {
+  compressors?: CompressionCodec[];
+}
 
 // ─── Identities & Recipients ────────────────────────────────────────────────
 
@@ -80,33 +119,57 @@ export interface MajikFileGroupKey {
 //   v2 (current, MJKB_VERSION): drops `c` entirely, adds an explicit `z`
 //     compression flag set once at encrypt time. Decrypt just reads it —
 //     no context lookup needed anywhere in the base decode path.
+//
+//     `ca` (compression algorithm) is an additive optional field on top of
+//     `z`, populated once a CompressionCodec other than the built-in zstd
+//     one is used at encrypt time (see CompressionCodec, ZSTD_CODEC).
+//     It's only meaningful when `z === true`. Absence means "zstd" — this
+//     covers every v2 payload ever produced before CompressionCodec
+//     existed, so no migration or MJKB_VERSION bump is needed; decodeMjkb()
+//     doesn't care how many keys a payload has. See hasCompressionAlg() in
+//     mjkb-codec.ts and COMPRESSION_SUITE in constants.ts.
 
+/**
+ * @deprecated
+ */
 export interface MjkbSinglePayloadV1 {
   mlKemCipherText: string;
   n: string | null;
   m: string | null;
   c: string | null;
 }
+
+/**
+ * @deprecated
+ */
 export interface MjkbGroupPayloadV1 {
   keys: MajikFileGroupKey[];
   n: string | null;
   m: string | null;
   c: string | null;
 }
+
+/**
+ * @deprecated
+ */
 export type MjkbPayloadV1 = MjkbSinglePayloadV1 | MjkbGroupPayloadV1;
 
 export interface MjkbSinglePayloadV2 {
   mlKemCipherText: string;
   n: string | null;
   m: string | null;
-  /** True if the plaintext was zstd-compressed before encryption. */
+  /** True if the plaintext was compressed before encryption. */
   z: boolean;
+  /** Compression algorithm identifier (e.g. "zstd"). Only meaningful when z === true. Absent means "zstd". */
+  ca?: string;
 }
 export interface MjkbGroupPayloadV2 {
   keys: MajikFileGroupKey[];
   n: string | null;
   m: string | null;
   z: boolean;
+  /** Compression algorithm identifier (e.g. "zstd"). Only meaningful when z === true. Absent means "zstd". */
+  ca?: string;
 }
 export type MjkbPayloadV2 = MjkbSinglePayloadV2 | MjkbGroupPayloadV2;
 
@@ -183,6 +246,17 @@ export interface MajikFileJSON {
   /** Self-describing crypto suite — see CRYPTO_SUITE. */
   kem_alg: string;
   cipher_alg: string;
+
+  compression_level?: CompressionLevel | number;
+  /**
+   * Self-describing compression algorithm — see COMPRESSION_SUITE, and the
+   * `ca` field on MjkbPayloadV2 (the binary carries the authoritative copy
+   * of this; this JSON field exists for introspection/UI without needing
+   * to decode the .mjkb binary). Absent on legacy/pre-existing records
+   * means "zstd" — the only algorithm that existed before CompressionCodec.
+   */
+  compression_alg?: string;
+
   timestamp: string | null;
   last_update: string | null;
   /** base64 — MajikSignature.serialize() output. */
@@ -193,6 +267,11 @@ export interface MajikFileJSON {
 export const DEFAULT_CRYPTO_SUITE_FIELDS = {
   kem_alg: CRYPTO_SUITE.kemAlg,
   cipher_alg: CRYPTO_SUITE.cipherAlg,
+} as const;
+
+/** Convenience default used when stamping new records — mirrors DEFAULT_CRYPTO_SUITE_FIELDS. */
+export const DEFAULT_COMPRESSION_SUITE_FIELDS = {
+  compression_alg: COMPRESSION_SUITE.alg,
 } as const;
 
 // ─── CreateOptions ────────────────────────────────────────────────────────────
@@ -221,8 +300,17 @@ export interface MajikFileCreateOptions {
   /**
    * Zstd compression level or preset. Always run through
    * MajikCompressor.adaptiveLevel() before use. Defaults to the max level.
+   * Ignored if a custom `compressor` is supplied and that codec doesn't
+   * use numeric levels — it's simply passed through as-is.
    */
   compressionLevel?: CompressionLevel | number;
+  /**
+   * Custom compression codec to use in place of the built-in
+   * MajikCompressor/zstd for this encryption. Wiring into _encryptCore()
+   * lands in a follow-up step — declared here now so the option surface
+   * is stable. @default ZSTD_CODEC
+   */
+  compressor?: CompressionCodec;
 }
 
 // ─── File Stats ───────────────────────────────────────────────────────────────

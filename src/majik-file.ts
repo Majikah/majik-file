@@ -11,6 +11,7 @@ import {
   MAX_GROUP_RECIPIENTS,
   FILE_SCHEMA_VERSION,
   CRYPTO_SUITE,
+  COMPRESSION_SUITE,
   MJKS_OVERHEAD,
   MJKS_MAGIC_LEN,
   MJKS_MAGIC,
@@ -37,8 +38,16 @@ import {
   decodeMjkb,
   resolveAesKeyFromPayload,
 } from "./core/mjkb-codec";
-import { MajikCompressor } from "./core/compressor/majik-compressor";
-import { isMjkbGroupPayload, hasCompressionFlag } from "./core/mjkb-codec";
+import {
+  CompressionLevel,
+  MajikCompressor,
+  ZSTD_CODEC,
+} from "./core/compressor/majik-compressor";
+import {
+  isMjkbGroupPayload,
+  hasCompressionFlag,
+  hasCompressionAlg,
+} from "./core/mjkb-codec";
 import type {
   MajikFileJSON,
   MajikFileCreateOptions,
@@ -50,6 +59,8 @@ import type {
   MajikFileStats,
   MajikFileDecryptIdentity,
   FileSignature,
+  CompressionCodec,
+  DecryptCompressionOptions,
 } from "./core/types";
 import {
   MajikSignature,
@@ -120,12 +131,16 @@ import {
  *   [4   payload JSON length (big-endian uint32)]
  *   [N   payload JSON — { n, m, z, mlKemCipherText } | { n, m, z, keys }]
  *   [M   AES-GCM ciphertext]
- *   `z` is an explicit "was this zstd-compressed" flag set at encrypt time —
+ *   `z` is an explicit "was this compressed" flag set at encrypt time —
  *   decrypt reads it directly instead of re-deriving a policy decision from
  *   context, which is what made the pre-refactor binary format secretly
  *   depend on a messaging-specific concept (FileContext). v1 binaries
  *   (which used `c` instead of `z`) remain readable — see decodeMjkb() and
- *   _decryptCore()'s legacy fallback.
+ *   _decryptCore()'s legacy fallback. An optional `ca` field alongside `z`
+ *   names the compression algorithm when it isn't the built-in zstd
+ *   default (see CompressionCodec, ZSTD_CODEC, COMPRESSION_SUITE) —
+ *   absent `ca` always means zstd, so every binary produced before
+ *   CompressionCodec existed decodes exactly as it always has.
  */
 
 // ── Batch / stats types ───────────────────────────────────────────────────
@@ -151,6 +166,15 @@ export interface EncryptCoreResult {
   resolvedMimeType: string | null;
   participants: MajikKeyAddress[];
   isGroup: boolean;
+  /**
+   * Compression algorithm actually used, or undefined if the file wasn't
+   * compressed at all, or was compressed with the default zstd codec.
+   * Mirrors payload.ca — undefined in both those cases keeps the default
+   * path's payload/JSON byte-for-byte identical to pre-CompressionCodec
+   * output. Only set when a non-default `compressor` was supplied AND the
+   * file was actually compressed.
+   */
+  compressionAlg?: string;
 }
 
 /** Input shape for _encryptCore() — the crypto-pipeline-only subset of a create() call. */
@@ -162,6 +186,11 @@ export interface EncryptCoreInput {
   mimeType: string | null;
   bypassSizeLimit: boolean;
   compressionLevel?: number;
+  /**
+   * Custom compression codec to use in place of the built-in
+   * MajikCompressor/zstd for this encryption. @default ZSTD_CODEC
+   */
+  compressor?: CompressionCodec;
   /**
    * Opaque passthrough to `_preProcess()`. Base ignores it entirely. A
    * subclass that overrides `_preProcess()` and needs extra platform data
@@ -190,6 +219,9 @@ export class MajikFile {
   protected readonly _participants: MajikKeyAddress[];
   protected readonly _kemAlg: string;
   protected readonly _cipherAlg: string;
+
+  protected readonly _compressionLevel?: CompressionLevel | number;
+
   protected readonly _timestamp: string | null;
   protected _lastUpdate: string | null;
   protected readonly _isGroup: boolean;
@@ -227,6 +259,7 @@ export class MajikFile {
     this._participants = json.participants;
     this._kemAlg = json.kem_alg;
     this._cipherAlg = json.cipher_alg;
+    this._compressionLevel = json.compression_level;
     this._timestamp = json.timestamp;
     this._lastUpdate = json.last_update;
     this._binary = binary;
@@ -321,6 +354,10 @@ export class MajikFile {
   /** The cached decrypted file, if decryptHydrate() has run this session. */
   get decryptedFile(): Uint8Array | undefined {
     return this._decrypted;
+  }
+
+  get compressionLevel(): number | null {
+    return this._compressionLevel || null;
   }
 
   // ── SIGNATURE ─────────────────────────────────────────────────────────────
@@ -429,9 +466,16 @@ export class MajikFile {
         await this._preProcess(raw, input.mimeType, input.preProcessExtra);
 
       const compress = this._resolveCompressionPolicy(resolvedMimeType);
+      const codec = input.compressor ?? ZSTD_CODEC;
       const compressed = compress
-        ? await MajikCompressor.compress(processedBytes, input.compressionLevel)
+        ? await codec.compress(processedBytes, input.compressionLevel)
         : processedBytes;
+      // Only stamp an algorithm tag when it's both compressed AND not the
+      // default codec — this is what keeps every existing call site's
+      // payload/JSON output byte-for-byte identical to before pluggable
+      // compression existed. See hasCompressionAlg() in mjkb-codec.ts.
+      const compressionAlg =
+        compress && codec.alg !== COMPRESSION_SUITE.alg ? codec.alg : undefined;
 
       const iv = generateRandomBytes(IV_LENGTH);
       const ivHex = Array.from(iv)
@@ -473,6 +517,7 @@ export class MajikFile {
           n: input.originalName ?? null,
           m: resolvedMimeType ?? null,
           z: compress,
+          ca: compressionAlg,
         };
       } else {
         const aesKey = generateRandomBytes(AES_KEY_LEN);
@@ -499,6 +544,7 @@ export class MajikFile {
             n: input.originalName ?? null,
             m: resolvedMimeType ?? null,
             z: compress,
+            ca: compressionAlg,
           };
         } finally {
           secureFill(aesKey);
@@ -516,6 +562,7 @@ export class MajikFile {
         resolvedMimeType,
         participants: participantPubKeys,
         isGroup: isGroupFile,
+        compressionAlg,
       };
     } catch (err) {
       if (err instanceof MajikFileError) throw err;
@@ -542,6 +589,7 @@ export class MajikFile {
       id = generateUUID(),
       bypassSizeLimit = false,
       compressionLevel,
+      compressor,
       userId,
     } = options;
 
@@ -560,6 +608,7 @@ export class MajikFile {
       mimeType,
       bypassSizeLimit,
       compressionLevel,
+      compressor,
     });
 
     const now = new Date().toISOString();
@@ -580,6 +629,8 @@ export class MajikFile {
       timestamp: now,
       last_update: now,
       signature: null,
+      compression_level: compressionLevel,
+      compression_alg: core.compressionAlg,
     };
 
     const instance = new MajikFile(json, core.binary, core.isGroup);
@@ -646,10 +697,37 @@ export class MajikFile {
   // ── DECRYPT (static) ──────────────────────────────────────────────────────
 
   /**
+   * Resolve which CompressionCodec's decompress() to call for a given
+   * payload's algorithm tag.
+   *
+   *   - `alg === COMPRESSION_SUITE.alg` ("zstd", including every payload
+   *     that predates CompressionCodec and has no `ca` at all) → always
+   *     ZSTD_CODEC. This path never needs `options` — the built-in codec
+   *     is never looked up in the caller-supplied list.
+   *   - Anything else → searched for in `options.compressors` by `alg`.
+   *     Not found → MajikFileError.unsupportedCompressionAlg(alg), since
+   *     silently falling back to zstd would corrupt the output rather
+   *     than fail loudly.
+   */
+  private static _resolveDecompressionCodec(
+    alg: string,
+    options?: DecryptCompressionOptions,
+  ): CompressionCodec {
+    if (alg === COMPRESSION_SUITE.alg) return ZSTD_CODEC;
+    const match = options?.compressors?.find((c) => c.alg === alg);
+    if (!match) throw MajikFileError.unsupportedCompressionAlg(alg);
+    return match;
+  }
+
+  /**
    * Core decrypt routine shared by decrypt() and decryptWithMetadata().
    * Decodes the .mjkb binary, recovers the AES key (single or group path),
    * authenticates + decrypts, and decompresses using the `z` flag when
    * present (v2) or the mime-only fallback policy for legacy v1 binaries.
+   * The algorithm used to decompress is resolved via `payload.ca` (v2,
+   * only when present) or defaults to zstd — see
+   * _resolveDecompressionCodec(). `options.compressors` only matters when
+   * `ca` names something other than the built-in zstd codec.
    *
    * Zeroization: the derived AES key is wiped in a `finally` immediately
    * after the decrypt attempt, regardless of success. If decompression
@@ -659,10 +737,14 @@ export class MajikFile {
    * Note: ML-KEM decapsulation NEVER throws on a wrong key — it returns a
    * garbage shared secret. AES-GCM authentication catches this silently
    * (aesGcmDecrypt returns null), surfaced here as decryptionFailed().
+   *
+   * @throws MajikFileError.unsupportedCompressionAlg if the payload names
+   *         a compression algorithm not found in `options.compressors`.
    */
   private static async _decryptCore(
     source: Blob | Uint8Array | ArrayBuffer,
     identity: MajikFileDecryptIdentity,
+    options?: DecryptCompressionOptions,
   ): Promise<{ bytes: Uint8Array; payload: AnyMjkbPayload }> {
     const resolved = MajikFile._resolveDecryptIdentity(identity);
 
@@ -690,14 +772,18 @@ export class MajikFile {
         ? payload.z
         : shouldCompressMime(payload.m); // legacy v1 fallback — mime-only, no context needed
 
-      const bytes = shouldDecompress
-        ? await MajikCompressor.decompress(decrypted)
-        : decrypted;
-
+      let bytes: Uint8Array;
       if (shouldDecompress) {
+        const alg = hasCompressionAlg(payload)
+          ? payload.ca
+          : COMPRESSION_SUITE.alg; // v1, or v2 without ca — both mean "zstd"
+        const codec = MajikFile._resolveDecompressionCodec(alg, options);
+        bytes = await codec.decompress(decrypted);
         // `decrypted` (the compressed intermediate) is now a redundant copy
         // of sensitive content once `bytes` holds the decompressed result.
         secureFill(decrypted);
+      } else {
+        bytes = decrypted;
       }
 
       return { bytes, payload };
@@ -709,14 +795,19 @@ export class MajikFile {
 
   /**
    * Decrypt a .mjkb Blob, Uint8Array, or ArrayBuffer.
-   * @throws MajikFileError on wrong key, missing key entry, corrupt data, or format errors.
+   * @param options.compressors Custom codecs to try when the payload names
+   *        a non-zstd compression algorithm. Unnecessary for files created
+   *        with the default codec.
+   * @throws MajikFileError on wrong key, missing key entry, corrupt data,
+   *         format errors, or an unresolvable compression algorithm.
    * @throws MajikKeyError if a MajikKey input is locked.
    */
   static async decrypt(
     source: Blob | Uint8Array | ArrayBuffer,
     identity: MajikFileDecryptIdentity,
+    options?: DecryptCompressionOptions,
   ): Promise<Uint8Array> {
-    const { bytes } = await MajikFile._decryptCore(source, identity);
+    const { bytes } = await MajikFile._decryptCore(source, identity, options);
     return bytes;
   }
 
@@ -729,13 +820,18 @@ export class MajikFile {
     source: Blob | Uint8Array | ArrayBuffer,
     identity: MajikFileDecryptIdentity,
     signatureRaw?: string | null,
+    options?: DecryptCompressionOptions,
   ): Promise<{
     bytes: Uint8Array;
     originalName: string | null;
     mimeType: string | null;
     signature: MajikSignature | null;
   }> {
-    const { bytes, payload } = await MajikFile._decryptCore(source, identity);
+    const { bytes, payload } = await MajikFile._decryptCore(
+      source,
+      identity,
+      options,
+    );
 
     let signature: MajikSignature | null = null;
     if (signatureRaw?.trim()) {
@@ -753,7 +849,10 @@ export class MajikFile {
    * Instance wrapper — automatically passes the attached signature.
    * @throws MajikFileError if _binary is not loaded or decryption fails.
    */
-  async decryptWithMetadata(identity: MajikFileDecryptIdentity): Promise<{
+  async decryptWithMetadata(
+    identity: MajikFileDecryptIdentity,
+    options?: DecryptCompressionOptions,
+  ): Promise<{
     bytes: Uint8Array;
     originalName: string | null;
     mimeType: string | null;
@@ -764,6 +863,7 @@ export class MajikFile {
       this._binary,
       identity,
       this._signature,
+      options,
     );
   }
 
@@ -771,19 +871,29 @@ export class MajikFile {
    * Decrypt the .mjkb binary already loaded on this instance.
    * @throws MajikFileError if _binary is not loaded or decryption fails.
    */
-  async decryptBinary(identity: MajikFileDecryptIdentity): Promise<Uint8Array> {
+  async decryptBinary(
+    identity: MajikFileDecryptIdentity,
+    options?: DecryptCompressionOptions,
+  ): Promise<Uint8Array> {
     if (!this._binary) throw MajikFileError.missingBinary();
-    return MajikFile.decrypt(this._binary, identity);
+    return MajikFile.decrypt(this._binary, identity, options);
   }
 
   /**
    * Decrypt the loaded binary and cache the plaintext on `_decrypted`.
    * Any stale cache is zeroized before being replaced. Returns `this`.
    */
-  async decryptHydrate(identity: MajikFileDecryptIdentity): Promise<this> {
+  async decryptHydrate(
+    identity: MajikFileDecryptIdentity,
+    options?: DecryptCompressionOptions,
+  ): Promise<this> {
     if (!this._binary) throw MajikFileError.missingBinary();
     if (this._decrypted) secureFill(this._decrypted);
-    const { bytes } = await MajikFile._decryptCore(this._binary, identity);
+    const { bytes } = await MajikFile._decryptCore(
+      this._binary,
+      identity,
+      options,
+    );
     this._decrypted = bytes;
     return this;
   }
@@ -817,10 +927,14 @@ export class MajikFile {
    * Decrypt an array of MajikFile (or subclass) instances concurrently.
    * Always attempts to hydrate/unlock the file directly. Files that cannot be
    * decrypted are collected in `errors` and excluded from `decrypted`.
+   * @param options.compressors Passed through to every file's
+   *        decryptHydrate() call — needed if any file in the batch was
+   *        compressed with a non-default codec.
    */
   static async batchDecrypt<T extends MajikFile>(
     files: T[],
     key: MajikKey | MajikFileDecryptIdentity,
+    options?: DecryptCompressionOptions,
   ): Promise<BatchDecryptResult<T>> {
     MajikFile._resolveDecryptIdentity(key);
 
@@ -834,7 +948,7 @@ export class MajikFile {
             `Key "${key.fingerprint}" is not a participant of this file.`,
           );
         }
-        await file.decryptHydrate(key);
+        await file.decryptHydrate(key, options);
         return file;
       }),
     );
@@ -1381,10 +1495,14 @@ export class MajikFile {
    * Decrypt (as a correctness gate — proves the given identity can access
    * this file and the ciphertext is well-formed), then verify the attached
    * signature against the same encrypted binary that sign()/verify() use.
+   * @param options.compressors Needed only if this file was compressed
+   *        with a non-default codec — passed through to the internal
+   *        decrypt() gate.
    */
   async verifyBinary(
     identity: MajikFileDecryptIdentity,
     keyOrPublicKeys: MajikKey | MajikSignerPublicKeys,
+    options?: DecryptCompressionOptions,
   ): Promise<VerificationResult> {
     if (!this._binary) throw MajikFileError.missingBinary();
     if (!this._signature?.trim()) {
@@ -1404,7 +1522,7 @@ export class MajikFile {
       );
     }
 
-    await MajikFile.decrypt(this._binary, identity);
+    await MajikFile.decrypt(this._binary, identity, options);
 
     if (MajikFile._isMajikKey(keyOrPublicKeys)) {
       return MajikSignature.verifyWithKey(this._binary, sig, keyOrPublicKeys);
@@ -1471,11 +1589,13 @@ export class MajikFile {
    * @param source Raw .mjkb source (Blob, Uint8Array, or ArrayBuffer)
    * @param identity Full identity (for crypto check) or fingerprint object (for group fast-check)
    * @param options.strict If true, forces full trial decryption even on group match. Default: false.
+   * @param options.compressors Needed only if `strict` triggers a full trial
+   *        decrypt on a file compressed with a non-default codec.
    */
   static async canDecryptMJKB(
     source: Blob | Uint8Array | ArrayBuffer,
     identity: MajikFileDecryptIdentity | { fingerprint: string },
-    options: { strict?: boolean } = {},
+    options: { strict?: boolean } & DecryptCompressionOptions = {},
   ): Promise<boolean> {
     try {
       const raw = MajikFile.stripMjksTrailer(
@@ -1497,7 +1617,13 @@ export class MajikFile {
 
       // 2. Single File or Strict Check: Requires full ML-KEM + AES trial decrypt
       if ("mlKemSecretKey" in identity) {
-        await MajikFile._decryptCore(raw, identity as MajikFileDecryptIdentity);
+        await MajikFile._decryptCore(
+          raw,
+          identity as MajikFileDecryptIdentity,
+          {
+            compressors: options.compressors,
+          },
+        );
         return true;
       }
 

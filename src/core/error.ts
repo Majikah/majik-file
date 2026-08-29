@@ -12,6 +12,7 @@ export type MajikFileErrorCode =
   | "MISSING_BINARY"
   | "UNSUPPORTED_VERSION"
   | "UNSUPPORTED_SCHEMA_VERSION"
+  | "UNSUPPORTED_COMPRESSION_ALG"
   | "LEGACY_MIGRATION_FAILED"
   | "STORAGE_KEY_MISMATCH";
 
@@ -114,6 +115,22 @@ export class MajikFileError extends Error {
       `Unsupported MajikFile record schema version: ${version}. ` +
         `This SDK supports up to schema v${supportedMax}. ` +
         `Upgrade the SDK, or this may be a legacy record — try fromLegacyJSON().`,
+    );
+  }
+
+  /**
+   * A .mjkb payload's `ca` names a compression algorithm that isn't the
+   * built-in zstd codec and wasn't found in the `compressors` array passed
+   * to the decrypt call. Distinct from decompressionFailed(), which is for
+   * a *recognised* codec's decompress() call itself throwing — this is
+   * "I don't even know what codec to try."
+   */
+  static unsupportedCompressionAlg(alg: string): MajikFileError {
+    return new MajikFileError(
+      "UNSUPPORTED_COMPRESSION_ALG",
+      `Unsupported compression algorithm: "${alg}". ` +
+        `No matching CompressionCodec was found in the "compressors" option ` +
+        `passed to this decrypt call.`,
     );
   }
 

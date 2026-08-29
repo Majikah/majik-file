@@ -98,3 +98,22 @@ export const CRYPTO_SUITE = {
 } as const;
 
 export type CryptoSuite = typeof CRYPTO_SUITE;
+
+// ─── Compression suite metadata ─────────────────────────────────────────────
+
+/**
+ * Self-describing default compression algorithm identifier — same
+ * rationale as CRYPTO_SUITE above, but for the compression layer.
+ *
+ * "zstd" (via MajikCompressor / ZSTD_CODEC — see majik-compressor.ts) is
+ * the only algorithm that has ever existed prior to pluggable
+ * CompressionCodec support, so `COMPRESSION_SUITE.alg` doubles as the
+ * implicit default whenever a record's `compression_alg` (JSON) or a
+ * payload's `ca` (.mjkb binary) is absent — every pre-existing record and
+ * binary is read as if it said "zstd" here, because it always was.
+ */
+export const COMPRESSION_SUITE = {
+  alg: "zstd",
+} as const;
+
+export type CompressionSuite = typeof COMPRESSION_SUITE;

@@ -9,8 +9,9 @@
  * Version-aware: decodeMjkb() reads whatever version is on the wire (v1
  * legacy or v2 current) and hands back the raw payload shape unmodified —
  * it does NOT decide compression policy. That decision (reading the v2 `z`
- * flag, or falling back to shouldCompressMime() for v1) belongs to
- * MajikFile._decryptCore(), keeping this module a pure structural codec.
+ * flag, resolving the v2 `ca` algorithm tag, or falling back to
+ * shouldCompressMime() for v1) belongs to MajikFile._decryptCore(), keeping
+ * this module a pure structural codec.
  */
 
 import {
@@ -48,6 +49,24 @@ export function isMjkbSinglePayload<T extends AnyMjkbPayload>(
 /** True if this payload is the v2 shape (has the explicit compression flag). */
 export function hasCompressionFlag(p: AnyMjkbPayload): p is MjkbPayloadV2 {
   return "z" in p;
+}
+
+/**
+ * True if this payload carries an explicit compression algorithm tag —
+ * i.e. it was produced by a CompressionCodec other than the built-in
+ * zstd one. Only meaningful when the payload is also compressed
+ * (hasCompressionFlag(p) && p.z === true).
+ *
+ * Absence of `ca` (every payload produced before CompressionCodec existed,
+ * plus any current payload encrypted with the default codec) means the
+ * algorithm is "zstd" — see COMPRESSION_SUITE in constants.ts. Callers
+ * resolving which codec to use for decompression should treat a missing
+ * `ca` and an explicit `ca: "zstd"` identically.
+ */
+export function hasCompressionAlg(
+  p: AnyMjkbPayload,
+): p is MjkbPayloadV2 & { ca: string } {
+  return "ca" in p && typeof (p as { ca?: unknown }).ca === "string";
 }
 
 // ─── Encode ───────────────────────────────────────────────────────────────────
