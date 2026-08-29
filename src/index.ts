@@ -7,3 +7,5 @@ export * from "./core/error";
 export * from "./core/validator";
 
 export * from "./core/mjkb-codec";
+
+export * from "./core/compressor/majik-compressor";
