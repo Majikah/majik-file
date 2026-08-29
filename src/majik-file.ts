@@ -1016,6 +1016,7 @@ export class MajikFile {
       participants: this._participants,
       kem_alg: this._kemAlg,
       cipher_alg: this._cipherAlg,
+      compression_level: this._compressionLevel,
       timestamp: this._timestamp,
       last_update: this._lastUpdate,
       signature: this._signature ?? null,
