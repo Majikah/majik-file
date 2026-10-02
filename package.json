@@ -55,16 +55,16 @@
   },
   "dependencies": {
     "@bokuweb/zstd-wasm": "^0.0.27",
-    "@majikah/majik-key": "^0.6.0",
-    "@majikah/majik-signature": "^0.7.1",
+    "@majikah/majik-key": "^0.7.0",
+    "@majikah/majik-signature": "^0.7.2",
     "@noble/post-quantum": "^0.7.1",
     "@stablelib/aes": "^2.0.1",
     "@stablelib/gcm": "^2.0.1",
     "@stablelib/sha256": "^2.0.1"
   },
   "devDependencies": {
-    "@types/node": "^26.6.3",
+    "@types/node": "^26.6.4",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.2"
+    "vitest": "^5.0.3"
   }
 }
