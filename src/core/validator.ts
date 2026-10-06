@@ -20,12 +20,12 @@
  * for platform-specific rules (context, storage type, R2 key shape, etc).
  */
 
-import { MajikFileError } from "./error";
+import { MajikFileError } from "./error.js";
 import {
   ML_KEM_PK_LEN,
   ML_KEM_SK_LEN,
   FILE_SCHEMA_VERSION,
-} from "./crypto/constants";
+} from "./crypto/constants.js";
 
 export class MajikFileValidator {
   // ── Aggregation helper ──────────────────────────────────────────────────

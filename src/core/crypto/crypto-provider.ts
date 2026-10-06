@@ -21,10 +21,10 @@ import {
   ML_KEM_PK_LEN,
   ML_KEM_SK_LEN,
   ML_KEM_CT_LEN,
-} from "./constants";
-import { MajikFileError } from "../error";
+} from "./constants.js";
+import { MajikFileError } from "../error.js";
 
-export { IV_LENGTH, AES_KEY_LEN };
+
 
 // ─── Random ───────────────────────────────────────────────────────────────────
 
@@ -156,14 +156,3 @@ export function mlKemDecapsulate(
   return ml_kem768.decapsulate(cipherText, recipientSecretKey);
 }
 
-/**
- * Generate a random ML-KEM-768 keypair.
- * Intended for testing only.
- * Production identities must use deriveMlKemKeypairFromSeed() from a BIP-39 mnemonic.
- */
-export function generateMlKemKeypair(): {
-  publicKey: Uint8Array;
-  secretKey: Uint8Array;
-} {
-  return ml_kem768.keygen();
-}

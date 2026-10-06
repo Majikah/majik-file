@@ -60,17 +60,3 @@ export function withZeroize<T>(
     secureFillMany(...bufs);
   }
 }
-
-/**
- * Async variant of withZeroize — awaits `fn`, then zeroizes in `finally`.
- */
-export async function withZeroizeAsync<T>(
-  bufs: Array<Uint8Array | null | undefined>,
-  fn: () => Promise<T>,
-): Promise<T> {
-  try {
-    return await fn();
-  } finally {
-    secureFillMany(...bufs);
-  }
-}

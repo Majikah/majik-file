@@ -15,7 +15,7 @@
  */
 
 import { hash } from "@stablelib/sha256";
-import { MajikFileError } from "./error";
+import { MajikFileError } from "./error.js";
 
 // ─── Hashing ──────────────────────────────────────────────────────────────────
 

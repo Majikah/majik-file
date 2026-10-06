@@ -6,14 +6,14 @@
  * all lives in core/types/message.ts, layered on top via MajikMessageFile.
  */
 
-import type { CompressionLevel } from "./compressor/majik-compressor";
+import type { CompressionLevel } from "./compressor/majik-compressor.js";
 import type {
   MajikKey,
   MajikKeyAddress,
   MajikKeyFingerprint,
   MLKEM768RawPublicKey,
 } from "@majikah/majik-key";
-import { CRYPTO_SUITE, COMPRESSION_SUITE } from "./crypto/constants";
+import { CRYPTO_SUITE, COMPRESSION_SUITE } from "./crypto/constants.js";
 
 // ─── Compression Codec (pluggable compression) ─────────────────────────────
 

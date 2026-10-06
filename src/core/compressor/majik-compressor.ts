@@ -14,9 +14,9 @@ import {
   compress as zstdCompress,
   decompress as zstdDecompress,
 } from "@bokuweb/zstd-wasm";
-import { MajikFileError } from "../error";
-import { COMPRESSION_SUITE } from "../crypto/constants";
-import type { CompressionCodec } from "../types";
+import { MajikFileError } from "../error.js";
+import { COMPRESSION_SUITE } from "../crypto/constants.js";
+import type { CompressionCodec } from "../types.js";
 
 /** Maximum Zstd compression level (highest ratio, slowest). */
 export const ZSTD_MAX_LEVEL = 22;

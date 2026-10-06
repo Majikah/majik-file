@@ -18,11 +18,11 @@ import {
   IV_LENGTH,
   MJKB_VERSION,
   MJKB_SUPPORTED_VERSIONS,
-} from "./crypto/constants";
-import { MajikFileError } from "./error";
-import { mlKemDecapsulate } from "./crypto/crypto-provider";
-import { withZeroize } from "./crypto/zeroize";
-import { arrayToBase64, base64ToArray } from "./utils";
+} from "./crypto/constants.js";
+import { MajikFileError } from "./error.js";
+import { mlKemDecapsulate } from "./crypto/crypto-provider.js";
+import { withZeroize } from "./crypto/zeroize.js";
+import { arrayToBase64, base64ToArray } from "./utils.js";
 
 import type {
   AnyMjkbPayload,
@@ -30,7 +30,7 @@ import type {
   DecodedMjkb,
   MajikFileGroupKey,
   MjkbPayloadV2,
-} from "./types";
+} from "./types.js";
 
 export const MJKB_MAGIC = [0x4d, 0x4a, 0x4b, 0x42]; // "MJKB"
 

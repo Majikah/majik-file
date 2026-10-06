@@ -3,7 +3,7 @@ import {
   aesGcmDecrypt,
   generateRandomBytes,
   mlKemEncapsulate,
-} from "./core/crypto/crypto-provider";
+} from "./core/crypto/crypto-provider.js";
 import {
   IV_LENGTH,
   AES_KEY_LEN,
@@ -15,10 +15,10 @@ import {
   MJKS_OVERHEAD,
   MJKS_MAGIC_LEN,
   MJKS_MAGIC,
-} from "./core/crypto/constants";
-import { MajikFileError } from "./core/error";
-import { MajikFileValidator } from "./core/validator";
-import { secureFill, withZeroize } from "./core/crypto/zeroize";
+} from "./core/crypto/constants.js";
+import { MajikFileError } from "./core/error.js";
+import { MajikFileValidator } from "./core/validator.js";
+import { secureFill, withZeroize } from "./core/crypto/zeroize.js";
 import {
   sha256Hex,
   formatBytes,
@@ -32,22 +32,22 @@ import {
   deduplicateRecipients,
   shouldCompressMime,
   sha256Base64,
-} from "./core/utils";
+} from "./core/utils.js";
 import {
   encodeMjkb,
   decodeMjkb,
   resolveAesKeyFromPayload,
-} from "./core/mjkb-codec";
+} from "./core/mjkb-codec.js";
 import {
   CompressionLevel,
   MajikCompressor,
   ZSTD_CODEC,
-} from "./core/compressor/majik-compressor";
+} from "./core/compressor/majik-compressor.js";
 import {
   isMjkbGroupPayload,
   hasCompressionFlag,
   hasCompressionAlg,
-} from "./core/mjkb-codec";
+} from "./core/mjkb-codec.js";
 import type {
   MajikFileJSON,
   MajikFileCreateOptions,
@@ -61,7 +61,7 @@ import type {
   FileSignature,
   CompressionCodec,
   DecryptCompressionOptions,
-} from "./core/types";
+} from "./core/types.js";
 import {
   MajikSignature,
   type MajikSignerPublicKeys,
