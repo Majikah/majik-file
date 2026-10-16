@@ -1,8 +1,9 @@
 # Majik File
 
-[![Developed by Zelijah](https://img.shields.io/badge/Developed%20by-Zelijah-red?logo=github&logoColor=white)](https://thezelijah.world) ![GitHub Sponsors](https://img.shields.io/github/sponsors/jedlsf?style=plastic&label=Sponsors&link=https%3A%2F%2Fgithub.com%2Fsponsors%2Fjedlsf)
+[![Developed by Zelijah](https://img.shields.io/badge/Developed%20by-Zelijah-red?logo=github&logoColor=white&style=for-the-badge)](https://thezelijah.world) ![GitHub Sponsors](https://img.shields.io/github/sponsors/jedlsf?style=for-the-badge&label=Sponsors&link=https%3A%2F%2Fgithub.com%2Fsponsors%2Fjedlsf)
 
-[![Static Badge](https://img.shields.io/badge/IANA-vnd.majikah.bundle-green)](https://www.iana.org/assignments/media-types/application/vnd.majikah.bundle)
+
+[![Static Badge](https://img.shields.io/badge/IANA-vnd.majikah.bundle-green?style=for-the-badge)](https://www.iana.org/assignments/media-types/application/vnd.majikah.bundle) 
 
 **Platform-agnostic post-quantum file encryption.** Produces self-contained `.mjkb` binary files — sealed with **ML-KEM-768 + AES-256-GCM**, optionally Zstd-compressed, readable without any network access.
 
