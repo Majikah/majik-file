@@ -51,6 +51,7 @@ import {
 import type {
   MajikFileJSON,
   MajikFileCreateOptions,
+  MajikFileEncryptionIdentity,
   MajikFileIdentity,
   MajikFileRecipient,
   MajikFileGroupKey,
@@ -180,7 +181,7 @@ export interface EncryptCoreResult {
 /** Input shape for _encryptCore() — the crypto-pipeline-only subset of a create() call. */
 export interface EncryptCoreInput {
   data: Uint8Array | ArrayBuffer;
-  identity: MajikFileIdentity;
+  identity: MajikFileEncryptionIdentity;
   recipients: MajikFileRecipient[];
   originalName: string | null;
   mimeType: string | null;

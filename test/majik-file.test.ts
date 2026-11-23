@@ -119,6 +119,35 @@ describe("MajikFile Class Unit Tests", () => {
       ).rejects.toThrow(/identity is required/i);
     });
 
+    it(
+      "creates a group .mjkb from public-only issuer and recipient identities",
+      async () => {
+        const publicIdentity = {
+          publicKey: alice.identity.publicKey,
+          fingerprint: alice.identity.fingerprint,
+          mlKemPublicKey: alice.identity.mlKemPublicKey,
+        };
+
+        const file = await MajikFile.create({
+          data: DUMMY_DATA,
+          userId: USER_ID,
+          identity: publicIdentity,
+          recipients: [bob.recipient],
+          mimeType: "application/pdf",
+        });
+
+        expect(file.isGroup).toBe(true);
+        const decryptedByIssuer = await MajikFile.decrypt(file.toMJKB(), alice.identity);
+        expect(decryptedByIssuer).toEqual(DUMMY_DATA);
+        const decryptedByRecipient = await MajikFile.decrypt(file.toMJKB(), {
+          fingerprint: bob.identity.fingerprint,
+          mlKemSecretKey: bob.identity.mlKemSecretKey,
+        });
+        expect(decryptedByRecipient).toEqual(DUMMY_DATA);
+      },
+      CRYPTO_TIMEOUT,
+    );
+
     it("should reject when userId is missing or blank", async () => {
       await expect(
         MajikFile.create({

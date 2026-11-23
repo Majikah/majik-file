@@ -57,16 +57,27 @@ export interface DecryptCompressionOptions {
 // ─── Identities & Recipients ────────────────────────────────────────────────
 
 /**
- * The file owner's full identity. Carries both keys — public for
- * encryption, secret for decryption.
+ * Public identity material sufficient to create an encrypted .mjkb.
+ *
+ * Encryption never needs the sender's ML-KEM secret key. Keeping this
+ * contract separate lets issuers encrypt for pinned MUID recipients without
+ * unlocking or copying any private key material into the encryption flow.
  */
-export interface MajikFileIdentity {
+export interface MajikFileEncryptionIdentity {
   publicKey: MajikKeyAddress;
-  /** Base64 SHA-256 of the ML-KEM public key — used to look up key entries. */
+  /** Base64 SHA-256 of the ML-KEM public key — used to identify key entries. */
   fingerprint: MajikKeyFingerprint;
   /** ML-KEM-768 public key (1184 bytes) — used during encryption. */
   mlKemPublicKey: MLKEM768RawPublicKey;
-  /** ML-KEM-768 secret key (2400 bytes) — used during decryption. */
+}
+
+/**
+ * Full identity material for operations that require decryption.
+ * The secret ML-KEM key remains local to the account and must never be
+ * persisted in session metadata or sent to a storage service.
+ */
+export interface MajikFileIdentity extends MajikFileEncryptionIdentity {
+  /** ML-KEM-768 secret key (2400 bytes) — used only during decryption. */
   mlKemSecretKey: Uint8Array;
 }
 
@@ -285,7 +296,7 @@ export interface MajikFileCreateOptions {
    * Identity of the file owner. For single-recipient files this is the
    * only recipient (self-encryption); for group files this is the sender.
    */
-  identity: MajikFileIdentity;
+  identity: MajikFileEncryptionIdentity;
   /**
    * Additional recipients beyond the owner. When provided (length ≥ 1),
    * a group .mjkb is produced. When omitted/empty, single-recipient.
