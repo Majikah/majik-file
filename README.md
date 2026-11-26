@@ -18,6 +18,9 @@
   - [Contents](#contents)
   - [How it works](#how-it-works)
   - [The .mjkb binary format](#the-mjkb-binary-format)
+    - [Common header](#common-header)
+    - [V3 payload](#v3-payload)
+    - [Legacy formats](#legacy-formats)
   - [Streaming API](#streaming-api)
   - [Extensibility \& Subclassing](#extensibility--subclassing)
   - [Installation](#installation)
@@ -36,7 +39,9 @@
     - [Majik Message](#majik-message)
     - [Majik Key](#majik-key)
     - [Majik Envelope](#majik-envelope)
+  - [License](#license)
   - [Author](#author)
+  - [Contact](#contact)
 
 ---
 
@@ -359,15 +364,25 @@ Seed phrase account library for generating deterministic ML-KEM-768 keypairs.
 The core cryptographic engine handling message encryption and multi-recipient key encapsulation.
 
 ---
-<h2>License</h2>
+
+## License
 
 [Apache-2.0](LICENSE) — free for personal and commercial use.
 
 ---
+
 ## Author
 
-Made with 💙 by [@thezelijah](https://github.com/jedlsf)
+Developed by **Josef Elijah Fabian (Zelijah)** | [Majikah Solutions OPC](https://majikah.solutions/about)
 
-- **Developer**: Josef Elijah Fabian
-- **GitHub**: [https://github.com/jedlsf](https://github.com/jedlsf)
+**Developer**: [Josef Elijah Fabian](https://github.com/jedlsf)
+**GitHub**: [https://github.com/Majikah](https://github.com/Majikah)
+**Project Repository**: [https://github.com/Majikah/majik-file](https://github.com/Majikah/majik-file)
+
+---
+
+## Contact
+
+- **Business Email**: [business@majikah.solutions](mailto:business@majikah.solutions)
 - **Official Website**: [https://www.thezelijah.world](https://www.thezelijah.world)
+- **Majikah Ecosystem**: [https://majikah.solutions](https://majikah.solutions)
