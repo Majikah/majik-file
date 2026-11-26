@@ -284,7 +284,7 @@ async function* iterateSource(
 
 class AsyncByteReader {
   private readonly iterator: AsyncIterator<Uint8Array>;
-  private current = new Uint8Array(0);
+  private current: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
   private offset = 0;
   private done = false;
 
@@ -682,7 +682,7 @@ class ZstdFrameTracker {
     | "block-body"
     | "checksum"
     | "done" = "header-prefix";
-  private pending = new Uint8Array(0);
+  private pending: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
   private headerLength = 5;
   private bodyRemaining = 0;
   private lastBlock = false;
