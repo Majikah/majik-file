@@ -9,3 +9,4 @@ export * from "./core/validator.js";
 export * from "./core/mjkb-codec.js";
 
 export * from "./core/compressor/majik-compressor.js";
+export * from "./core/streaming.js";

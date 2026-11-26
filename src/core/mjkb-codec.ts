@@ -6,8 +6,8 @@
  * one module that understands the binary's byte layout, kept isolated so
  * a future format change touches exactly one file.
  *
- * Version-aware: decodeMjkb() reads whatever version is on the wire (v1
- * legacy or v2 current) and hands back the raw payload shape unmodified —
+ * Version-aware: decodeMjkb() reads v1/v2 legacy files and v3 streaming
+ * files, handing back the payload shape unmodified —
  * it does NOT decide compression policy. That decision (reading the v2 `z`
  * flag, resolving the v2 `ca` algorithm tag, or falling back to
  * shouldCompressMime() for v1) belongs to MajikFile._decryptCore(), keeping
@@ -17,6 +17,7 @@
 import {
   IV_LENGTH,
   MJKB_VERSION,
+  MJKB_VERSION_V2,
   MJKB_SUPPORTED_VERSIONS,
 } from "./crypto/constants.js";
 import { MajikFileError } from "./error.js";
@@ -30,6 +31,8 @@ import type {
   DecodedMjkb,
   MajikFileGroupKey,
   MjkbPayloadV2,
+  MjkbPayloadV1,
+  MjkbPayloadV3,
 } from "./types.js";
 
 export const MJKB_MAGIC = [0x4d, 0x4a, 0x4b, 0x42]; // "MJKB"
@@ -46,8 +49,10 @@ export function isMjkbSinglePayload<T extends AnyMjkbPayload>(
   return "mlKemCipherText" in p && !("keys" in p);
 }
 
-/** True if this payload is the v2 shape (has the explicit compression flag). */
-export function hasCompressionFlag(p: AnyMjkbPayload): p is MjkbPayloadV2 {
+/** True for v2/v3 payloads, which carry an explicit compression flag. */
+export function hasCompressionFlag(
+  p: AnyMjkbPayload,
+): p is MjkbPayloadV2 | MjkbPayloadV3 {
   return "z" in p;
 }
 
@@ -65,16 +70,16 @@ export function hasCompressionFlag(p: AnyMjkbPayload): p is MjkbPayloadV2 {
  */
 export function hasCompressionAlg(
   p: AnyMjkbPayload,
-): p is MjkbPayloadV2 & { ca: string } {
+): p is (MjkbPayloadV2 | MjkbPayloadV3) & { ca: string } {
   return "ca" in p && typeof (p as { ca?: unknown }).ca === "string";
 }
 
 // ─── Encode ───────────────────────────────────────────────────────────────────
 
 /**
- * Encode a .mjkb binary. Always writes the current MJKB_VERSION — encoding
- * an old (v1) payload shape is not supported; v1 only ever appears when
- * *reading* pre-existing binaries.
+ * Encode a legacy-compatible MJKB v2 binary. The v3 streaming writer lives
+ * in streaming.ts because its body is a sequence of authenticated records,
+ * not one AES-GCM ciphertext. V1 remains read-only.
  */
 export function encodeMjkb(
   iv: Uint8Array,
@@ -94,7 +99,7 @@ export function encodeMjkb(
   );
 
   out.set(MJKB_MAGIC, 0);
-  out[MJKB_MAGIC.length] = MJKB_VERSION;
+  out[MJKB_MAGIC.length] = MJKB_VERSION_V2;
   out.set(iv, MJKB_MAGIC.length + 1);
 
   const lenOffset = MJKB_MAGIC.length + 1 + IV_LENGTH;
@@ -156,15 +161,42 @@ export function decodeMjkb(raw: Uint8Array): DecodedMjkb {
     );
   }
 
-  let payload: AnyMjkbPayload;
+  if (version === MJKB_VERSION && payloadLen > 1024 * 1024) {
+    throw MajikFileError.formatError("Malformed MJKB v3: payload JSON exceeds 1 MiB");
+  }
+
+  let parsed: unknown;
   try {
-    payload = JSON.parse(
+    parsed = JSON.parse(
       new TextDecoder().decode(raw.slice(payloadStart, ciphertextStart)),
     );
   } catch {
     throw MajikFileError.formatError(
       "Malformed .mjkb: payload JSON failed to parse",
     );
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw MajikFileError.formatError("Malformed .mjkb: payload must be a JSON object");
+  }
+
+  let payload: AnyMjkbPayload;
+  if (version === MJKB_VERSION) {
+    const v3 = parsed as Record<string, unknown>;
+    const single = typeof v3.mlKemCipherText === "string" && !("keys" in v3);
+    const group = Array.isArray(v3.keys) && v3.keys.length > 0 && !("mlKemCipherText" in v3);
+    if (
+      (!single && !group) ||
+      typeof v3.z !== "boolean" ||
+      !Number.isInteger(v3.chunkSize) ||
+      typeof v3.streamSuite !== "string"
+    ) {
+      throw MajikFileError.formatError("Malformed MJKB v3 payload fields");
+    }
+    payload = parsed as MjkbPayloadV3;
+  } else if (version === MJKB_VERSION_V2) {
+    payload = parsed as MjkbPayloadV2;
+  } else {
+    payload = parsed as MjkbPayloadV1;
   }
 
   const ciphertext = raw.slice(ciphertextStart);
