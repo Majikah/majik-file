@@ -119,59 +119,32 @@ export interface MajikFileGroupKey {
 
 // ─── .mjkb Payload Types ─────────────────────────────────────────────────────
 //
-// Two payload generations coexist so old binaries stay readable:
+// Three payload generations coexist so existing files remain readable:
 //
-//   v1 (legacy, MJKB_VERSION_LEGACY): payload.c embedded the FileContext, and
-//     decrypt-time decompression was *inferred* from context + mime. That's
-//     a platform-specific heuristic living inside what should be a generic
-//     binary format — fixed in v2. `c` is typed as `string | null` here
-//     rather than FileContext, since the base layer doesn't know that type.
-//
-//   v2 (current, MJKB_VERSION): drops `c` entirely, adds an explicit `z`
-//     compression flag set once at encrypt time. Decrypt just reads it —
-//     no context lookup needed anywhere in the base decode path.
-//
-//     `ca` (compression algorithm) is an additive optional field on top of
-//     `z`, populated once a CompressionCodec other than the built-in zstd
-//     one is used at encrypt time (see CompressionCodec, ZSTD_CODEC).
-//     It's only meaningful when `z === true`. Absence means "zstd" — this
-//     covers every v2 payload ever produced before CompressionCodec
-//     existed, so no migration or MJKB_VERSION bump is needed; decodeMjkb()
-//     doesn't care how many keys a payload has. See hasCompressionAlg() in
-//     mjkb-codec.ts and COMPRESSION_SUITE in constants.ts.
+// v1 is legacy and infers compression from the old context + MIME policy.
+// v2 uses the explicit z flag and the original whole-buffer AES-GCM layout.
+// v3 retains the same recipient key material and adds the streaming suite,
+// chunk size, and authenticated final-manifest contract.
 
-/**
- * @deprecated
- */
 export interface MjkbSinglePayloadV1 {
   mlKemCipherText: string;
   n: string | null;
   m: string | null;
   c: string | null;
 }
-
-/**
- * @deprecated
- */
 export interface MjkbGroupPayloadV1 {
   keys: MajikFileGroupKey[];
   n: string | null;
   m: string | null;
   c: string | null;
 }
-
-/**
- * @deprecated
- */
 export type MjkbPayloadV1 = MjkbSinglePayloadV1 | MjkbGroupPayloadV1;
 
 export interface MjkbSinglePayloadV2 {
   mlKemCipherText: string;
   n: string | null;
   m: string | null;
-  /** True if the plaintext was compressed before encryption. */
   z: boolean;
-  /** Compression algorithm identifier (e.g. "zstd"). Only meaningful when z === true. Absent means "zstd". */
   ca?: string;
 }
 export interface MjkbGroupPayloadV2 {
@@ -179,29 +152,53 @@ export interface MjkbGroupPayloadV2 {
   n: string | null;
   m: string | null;
   z: boolean;
-  /** Compression algorithm identifier (e.g. "zstd"). Only meaningful when z === true. Absent means "zstd". */
   ca?: string;
 }
 export type MjkbPayloadV2 = MjkbSinglePayloadV2 | MjkbGroupPayloadV2;
 
-/** "Current" payload shape — what encodeMjkb() always produces going forward. */
+/** v3 single-recipient stream payload. Property order mirrors Rust serde. */
+export interface MjkbSinglePayloadV3 {
+  mlKemCipherText: string;
+  n: string | null;
+  m: string | null;
+  z: boolean;
+  /** Omitted for the standard Zstandard streaming codec. */
+  ca?: string;
+  chunkSize: number;
+  streamSuite: string;
+}
+
+/** v3 group stream payload. Property order mirrors Rust serde. */
+export interface MjkbGroupPayloadV3 {
+  keys: MajikFileGroupKey[];
+  n: string | null;
+  m: string | null;
+  z: boolean;
+  /** Omitted for the standard Zstandard streaming codec. */
+  ca?: string;
+  chunkSize: number;
+  streamSuite: string;
+}
+export type MjkbPayloadV3 = MjkbSinglePayloadV3 | MjkbGroupPayloadV3;
+
+/** Legacy v2 payload alias retained for the compatibility encoder. */
 export type MjkbPayload = MjkbPayloadV2;
 
-/** Any payload shape decodeMjkb() might hand back, legacy or current. */
-export type AnyMjkbPayload = MjkbPayloadV1 | MjkbPayloadV2;
+/** Any payload shape decodeMjkb() may return. */
+export type AnyMjkbPayload = MjkbPayloadV1 | MjkbPayloadV2 | MjkbPayloadV3;
 
 // ─── Decoded .mjkb Binary ────────────────────────────────────────────────────
 
 /**
- * Internal representation of a fully parsed .mjkb binary. `version` drives
- * dispatch between the v1 legacy decode/decompress path and the v2 current
- * one — see decodeMjkb() in majik-file.ts.
+ * Parsed .mjkb header and body. For v1/v2, ciphertext is the single AES-GCM
+ * ciphertext+tag. For v3, ciphertext is the chunk-record stream and final
+ * authenticated manifest; use the streaming reader to decrypt it.
  */
 export interface DecodedMjkb {
   version: number;
-  /** IV extracted from the binary header — authoritative source for decryption. */
+  /** Nonce / IV extracted from the binary header. */
   iv: Uint8Array;
-  /** AES-GCM ciphertext (compressed plaintext, if applicable + 16-byte auth tag). */
+  /** Single ciphertext for v1/v2; the complete record section for v3. */
   ciphertext: Uint8Array;
   payload: AnyMjkbPayload;
 }
@@ -309,17 +306,13 @@ export interface MajikFileCreateOptions {
   /** Bypass the MAX_FILE_SIZE_BYTES limit. @default false */
   bypassSizeLimit?: boolean;
   /**
-   * Zstd compression level or preset. Always run through
-   * MajikCompressor.adaptiveLevel() before use. Defaults to the max level.
-   * Ignored if a custom `compressor` is supplied and that codec doesn't
-   * use numeric levels — it's simply passed through as-is.
+   * Zstd compression level. MJKB v3 defaults to level 6 to match the Rust
+   * streaming SDK. Explicit createV2() retains the legacy adaptive level.
    */
   compressionLevel?: CompressionLevel | number;
   /**
-   * Custom compression codec to use in place of the built-in
-   * MajikCompressor/zstd for this encryption. Wiring into _encryptCore()
-   * lands in a follow-up step — declared here now so the option surface
-   * is stable. @default ZSTD_CODEC
+   * Custom compression codec. Since the v3 stream contract standardizes
+   * Zstandard only, supplying a custom codec automatically uses v2.
    */
   compressor?: CompressionCodec;
 }

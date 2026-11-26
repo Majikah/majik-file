@@ -9,6 +9,7 @@ import {
   AES_KEY_LEN,
   MAX_FILE_SIZE_BYTES,
   MAX_GROUP_RECIPIENTS,
+  MJKB_SUPPORTED_VERSIONS,
   FILE_SCHEMA_VERSION,
   CRYPTO_SUITE,
   COMPRESSION_SUITE,
@@ -48,6 +49,10 @@ import {
   hasCompressionFlag,
   hasCompressionAlg,
 } from "./core/mjkb-codec.js";
+import {
+  encryptBytesToMjkbV3,
+  decryptMjkbV3ToBuffer,
+} from "./core/streaming.js";
 import type {
   MajikFileJSON,
   MajikFileCreateOptions,
@@ -125,7 +130,7 @@ import {
  *   kem_alg / cipher_alg are stamped on every new record (CRYPTO_SUITE) so
  *   a future suite change is a detectable, migratable fact.
  *
- * ─── .mjkb binary format (v2) ────────────────────────────────────────────
+ * ─── .mjkb binary format (v3 default; v1/v2 remain readable) ────────────
  *   [4   magic "MJKB"]
  *   [1   version]
  *   [12  AES-GCM IV]
@@ -202,6 +207,8 @@ export interface EncryptCoreInput {
    * entire static method hierarchy for a single, rarely-needed hook.
    */
   preProcessExtra?: unknown;
+  /** Binary format to write. New writes default to v3; v2 is compatibility-only. */
+  formatVersion?: 2 | 3;
 }
 
 export class MajikFile {
@@ -468,6 +475,33 @@ export class MajikFile {
 
       const compress = this._resolveCompressionPolicy(resolvedMimeType);
       const codec = input.compressor ?? ZSTD_CODEC;
+
+      // Standard files use the same authenticated MJKB v3 chunk stream as
+      // Rust. Arbitrary user codecs retain the interoperable v2 buffer format
+      // until a cross-language streaming codec contract exists.
+      if ((input.formatVersion ?? 3) === 3 && !input.compressor) {
+        const { binary, result } = await encryptBytesToMjkbV3(
+          processedBytes,
+          input.identity,
+          input.recipients,
+          input.originalName,
+          resolvedMimeType,
+          compress,
+          input.compressionLevel ?? 6,
+        );
+        return {
+          binary,
+          ivHex: result.encryptionIv,
+          fileHash,
+          sizeOriginal: raw.byteLength,
+          sizeStored: binary.byteLength,
+          resolvedMimeType,
+          participants: result.participants,
+          isGroup: result.isGroup,
+          compressionAlg: undefined,
+        };
+      }
+
       const compressed = compress
         ? await codec.compress(processedBytes, input.compressionLevel)
         : processedBytes;
@@ -580,7 +614,23 @@ export class MajikFile {
    * wrappers) instead — they share this same crypto pipeline via
    * _encryptCore(), not by inheriting this method.
    */
+  /** Create a new MJKB v3 file by default. */
   static async create(options: MajikFileCreateOptions): Promise<MajikFile> {
+    return MajikFile._createWithFormat(options, 3);
+  }
+
+  /**
+   * Explicit legacy-compatible writer for downstream consumers that still
+   * require the whole-buffer MJKB v2 layout. New integrations should use v3.
+   */
+  static async createV2(options: MajikFileCreateOptions): Promise<MajikFile> {
+    return MajikFile._createWithFormat(options, 2);
+  }
+
+  private static async _createWithFormat(
+    options: MajikFileCreateOptions,
+    formatVersion: 2 | 3,
+  ): Promise<MajikFile> {
     const {
       data,
       identity,
@@ -610,6 +660,7 @@ export class MajikFile {
       bypassSizeLimit,
       compressionLevel,
       compressor,
+      formatVersion,
     });
 
     const now = new Date().toISOString();
@@ -753,6 +804,11 @@ export class MajikFile {
       const raw = MajikFile.stripMjksTrailer(
         await normaliseToUint8ArrayAsync(source),
       );
+      if (raw.length >= 5 && raw[4] === 0x03) {
+        const streamed = await decryptMjkbV3ToBuffer(raw, resolved);
+        return { bytes: streamed.bytes, payload: streamed.result.payload };
+      }
+
       const { iv, payload, ciphertext } = decodeMjkb(raw);
 
       const aesKey = resolveAesKeyFromPayload(payload, resolved);
@@ -1376,6 +1432,9 @@ export class MajikFile {
       }
 
       const version = bytes[4];
+      if (!(MJKB_SUPPORTED_VERSIONS as readonly number[]).includes(version)) {
+        return false;
+      }
       const payloadLenOffset = 17; // 4 magic + 1 version + 12 IV
       const payloadLen =
         (bytes[payloadLenOffset] << 24) |
@@ -1406,10 +1465,16 @@ export class MajikFile {
         Array.isArray((payload as { keys: unknown }).keys) &&
         (payload as { keys: unknown[] }).keys.length > 0;
       if (!isSingle && !isGroup) return false;
+      if (version === 0x03) {
+        const v3 = payload as Record<string, unknown>;
+        if (
+          typeof v3.z !== "boolean" ||
+          !Number.isInteger(v3.chunkSize) ||
+          typeof v3.streamSuite !== "string"
+        ) return false;
+      }
 
       if (bytes.length <= ciphertextStart) return false;
-
-      void version; // version itself isn't part of the structural check — decodeMjkb() enforces it
       return true;
     } catch {
       return false;

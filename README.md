@@ -5,7 +5,7 @@
 
 [![Static Badge](https://img.shields.io/badge/IANA-vnd.majikah.bundle-green?style=for-the-badge)](https://www.iana.org/assignments/media-types/application/vnd.majikah.bundle) 
 
-**Platform-agnostic post-quantum file encryption.** Produces self-contained `.mjkb` binary files — sealed with **ML-KEM-768 + AES-256-GCM**, optionally Zstd-compressed, readable without any network access.
+**Platform-agnostic post-quantum file encryption.** Produces self-contained `.mjkb` binary files — sealed with **ML-KEM-768 + chunked AES-256-GCM**, optionally streaming Zstandard-compressed, readable without any network access.
 
 > **Note on Architecture:** This library provides the core, decoupled `MajikFile` base class. It knows nothing about chat, threads, or storage backends. For Majikah messaging-specific implementations — including R2 keys, automatic WebP image conversions, and chat context routing — use `MajikMessageFile` (which subclasses `MajikFile`). 
 
@@ -18,6 +18,7 @@
   - [Contents](#contents)
   - [How it works](#how-it-works)
   - [The .mjkb binary format](#the-mjkb-binary-format)
+  - [Streaming API](#streaming-api)
   - [Extensibility \& Subclassing](#extensibility--subclassing)
   - [Installation](#installation)
   - [Quick start](#quick-start)
@@ -84,47 +85,97 @@ The encrypted binary is completely self-contained.
 
 ## The .mjkb binary format
 
-Version: `0x01` (v2 Payload)
+New files are written as **MJKB v3**. V3 uses the same ML-KEM-768 recipient
+encapsulation as v2, but encrypts the compressed or raw stream as independently
+authenticated AES-256-GCM chunks. V1 and v2 remain supported for decryption.
+
+### Common header
 
 ```
-┌──────────────────────────────────────────────────────┐
-│  4 bytes  │  Magic: ASCII "MJKB"  (0x4D 0x4A 0x4B 0x42)  │
-│  1 byte   │  Version (currently 0x01)                      │
-│ 12 bytes  │  AES-GCM IV (random per file)                  │
-│  4 bytes  │  Payload JSON length (big-endian uint32)        │
-│  N bytes  │  Payload JSON (UTF-8)                           │
-│  M bytes  │  AES-GCM ciphertext (compressed plaintext + 16-byte auth tag) │
-└──────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  4 bytes  │ Magic: ASCII "MJKB"                           │
+│  1 byte   │ Version: 0x03                                 │
+│ 12 bytes  │ Random nonce base                             │
+│  4 bytes  │ Payload JSON length (big-endian uint32)       │
+│  N bytes  │ UTF-8 payload JSON                            │
+│  ...      │ Chunk records, then authenticated manifest   │
+└──────────────────────────────────────────────────────────┘
 ```
 
-**Single-recipient payload JSON (v2):**
-```json
-{
-  "mlKemCipherText": "<base64, 1088 bytes>",
-  "n": "photo.png",
-  "m": "image/png",
-  "z": true
-}
-```
+### V3 payload
 
-**Group payload JSON (v2):**
-```json
-{
-  "keys": [
-    {
-      "fingerprint": "<base64 SHA-256 of public key>",
-      "mlKemCipherText": "<base64, 1088 bytes>",
-      "encryptedAesKey": "<base64, 32 bytes>"
-    }
-  ],
-  "n": "photo.png",
-  "m": "image/png",
-  "z": true
-}
-```
-*Note: `z` is the explicit compression flag (v2). Older v1 legacy payloads used `c` and inferred decompression from messaging contexts.*
+Single-recipient payloads carry `mlKemCipherText`; group payloads carry a
+`keys` array with one ML-KEM encapsulation and wrapped AES key per recipient.
+Both payload variants then carry `n`, `m`, `z`, `chunkSize`, and
+`streamSuite`. The current stream suite is
+`AES-256-GCM-CHUNKED-1`. The standard Zstandard codec is implicit, so `ca`
+is omitted.
+
+Each record is a big-endian uint32 ciphertext length followed by the AES-GCM
+ciphertext and 16-byte tag. The nonce counter is derived from the 12-byte base
+nonce and the zero-based chunk index. Associated data binds the payload hash,
+chunk index, and plaintext chunk length.
+
+The final record uses a zero length sentinel, followed by a 56-byte manifest
+(chunk count, compressed byte count, original byte count, and SHA-256 of the
+original stream) and an authentication-only AES-GCM tag. The manifest is
+mandatory; incomplete, reordered, altered, or trailing data is rejected.
+
+### Legacy formats
+
+- **V1** remains read-only. It used the legacy `c` field and inferred
+  decompression from context and MIME metadata.
+- **V2** remains readable and can still be written explicitly through
+  `MajikFile.createV2()`. Its body is one whole-buffer AES-GCM ciphertext.
 
 ---
+
+## Streaming API
+
+For large files, use the reader/writer API rather than the in-memory
+`MajikFile.create()` convenience method. It processes source and output
+incrementally and uses the same Zstandard streaming implementation as the
+Rust SDK.
+
+```ts
+import {
+  encryptReaderToWriter,
+  decryptReaderToWriter,
+} from "@majikah/majik-file";
+
+// Browser File System Access API handles are used here as an example.
+const encryptedOutput = await encryptedFileHandle.createWritable();
+await encryptReaderToWriter(
+  sourceFile.stream(),
+  encryptedOutput,
+  ownerPublicIdentity,
+  recipients,
+  sourceFile.name,
+  sourceFile.type,
+  {
+    totalBytes: sourceFile.size,
+    onProgress: ({ bytesProcessed, totalBytes }) => {
+      console.log(bytesProcessed, totalBytes);
+    },
+  },
+);
+
+const encryptedFile = await encryptedInputHandle.getFile();
+const plaintextOutput = await plaintextFileHandle.createWritable();
+await decryptReaderToWriter(
+  encryptedFile.stream(),
+  plaintextOutput,
+  { fingerprint, mlKemSecretKey },
+);
+```
+
+The streaming functions accept a `ReadableStream<Uint8Array>` or
+`AsyncIterable<Uint8Array>` source and a `WritableStream<Uint8Array>`
+destination. They support cancellation, progress callbacks, byte ceilings,
+single-recipient and group encryption, and optional standard Zstandard
+compression. Use a temporary destination and only publish it after the
+operation resolves: decryption may have written earlier authenticated chunks
+before a later manifest or stream-integrity failure is discovered.
 
 ## Extensibility & Subclassing
 

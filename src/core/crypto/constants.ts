@@ -39,23 +39,20 @@ export const MAX_GROUP_RECIPIENTS = 32;
 // ─── .mjkb binary format ────────────────────────────────────────────────────
 
 /**
- * v1 (legacy): [magic][version][iv][payloadLen][payload{n,m,c,...}][ciphertext]
- *   - payload.c (FileContext) was baked directly into the binary, and
- *     decrypt-time decompression was *inferred* from context + mime — a
- *     platform-specific heuristic living inside a supposedly-generic binary
- *     format. Fixed in v2.
+ * MJKB wire-format versions:
+ * - v1: legacy payload with a context field and inferred compression policy.
+ * - v2: single-buffer AES-GCM ciphertext with an explicit compression flag.
+ * - v3: chunked AES-GCM records, per-record AAD, and an authenticated manifest.
  *
- * v2 (current): payload drops `c` entirely and gains an explicit
- *   `z: boolean` compression flag, set once at encrypt time.
- *   - decrypt no longer needs to know anything about FileContext — the
- *     binary is now genuinely self-describing and platform-agnostic.
- *   - v1 binaries remain readable via a clearly-marked legacy decode path
- *     in decodeMjkb() (see majik-file.ts).
+ * New files use v3. V1 and v2 remain readable; createV2() is the explicit
+ * compatibility writer for consumers that have not adopted streaming v3.
  */
-export const MJKB_VERSION = 0x02;
 export const MJKB_VERSION_LEGACY = 0x01;
+export const MJKB_VERSION_V2 = 0x02;
+export const MJKB_VERSION = 0x03;
 export const MJKB_SUPPORTED_VERSIONS = [
   MJKB_VERSION_LEGACY,
+  MJKB_VERSION_V2,
   MJKB_VERSION,
 ] as const;
 

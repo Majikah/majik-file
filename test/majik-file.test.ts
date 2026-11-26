@@ -30,6 +30,7 @@ import {
   ML_KEM_SK_LEN,
   MAX_FILE_SIZE_BYTES,
   MJKB_VERSION,
+  MJKB_VERSION_V2,
   FILE_SCHEMA_VERSION,
 } from "../src/core/crypto/constants";
 import type { MajikKey } from "@majikah/majik-key";
@@ -279,6 +280,24 @@ describe("MajikFile Class Unit Tests", () => {
 
         const { payload } = decodeMjkb(bytes);
         expect(isMjkbSinglePayload(payload)).toBe(true);
+      },
+      CRYPTO_TIMEOUT,
+    );
+
+    it(
+      "keeps a v2 compatibility writer available for older consumers",
+      async () => {
+        const legacyFile = await MajikFile.createV2({
+          data: DUMMY_DATA,
+          userId: USER_ID,
+          identity: alice.identity,
+          originalName: "legacy-report.pdf",
+          mimeType: "application/pdf",
+        });
+        const legacyBytes = legacyFile.toBinaryBytes();
+        expect(legacyBytes[4]).toBe(MJKB_VERSION_V2);
+        const decrypted = await MajikFile.decrypt(legacyBytes, alice.identity);
+        expect(decrypted).toEqual(DUMMY_DATA);
       },
       CRYPTO_TIMEOUT,
     );

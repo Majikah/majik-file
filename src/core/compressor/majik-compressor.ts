@@ -2,7 +2,8 @@
  * majik-compressor.ts
  *
  * Zstd (WASM) compression provider for MajikFile.
- * Uses @bokuweb/zstd-wasm exclusively — no gzip fallback.
+ * Uses the same pure-Rust Zstandard implementation as the Rust SDK via
+ * @structured-world/structured-zstd. It supports one-shot and streaming paths.
  *
  * The WASM module is initialised lazily on first use and cached for the
  * lifetime of the module. Subsequent calls are synchronous after the first
@@ -13,7 +14,7 @@ import {
   init,
   compress as zstdCompress,
   decompress as zstdDecompress,
-} from "@bokuweb/zstd-wasm";
+} from "@structured-world/structured-zstd";
 import { MajikFileError } from "../error.js";
 import { COMPRESSION_SUITE } from "../crypto/constants.js";
 import type { CompressionCodec } from "../types.js";
