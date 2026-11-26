@@ -41,6 +41,7 @@
     - [Majik Envelope](#majik-envelope)
   - [License](#license)
   - [Author](#author)
+  - [About the Developer](#about-the-developer)
   - [Contact](#contact)
 
 ---
@@ -370,19 +371,19 @@ The core cryptographic engine handling message encryption and multi-recipient ke
 [Apache-2.0](LICENSE) — free for personal and commercial use.
 
 ---
-
 ## Author
 
 Developed by **Josef Elijah Fabian (Zelijah)** | [Majikah Solutions OPC](https://majikah.solutions/about)
 
-**Developer**: [Josef Elijah Fabian](https://github.com/jedlsf)
-**GitHub**: [https://github.com/Majikah](https://github.com/Majikah)
-**Project Repository**: [https://github.com/Majikah/majik-file](https://github.com/Majikah/majik-file)
+## About the Developer
+
+- **Developer**: Josef Elijah Fabian
+- **GitHub**: [https://github.com/jedlsf](https://github.com/jedlsf)
+- **Project Repository**: [https://github.com/Majikah/majik-file](https://github.com/Majikah/majik-file)
 
 ---
 
 ## Contact
 
-- **Business Email**: [business@majikah.solutions](mailto:business@majikah.solutions)
+- **Business Email**: [business@thezelijah.world](mailto:business@thezelijah.world)
 - **Official Website**: [https://www.thezelijah.world](https://www.thezelijah.world)
-- **Majikah Ecosystem**: [https://majikah.solutions](https://majikah.solutions)
