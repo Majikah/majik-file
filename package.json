@@ -67,10 +67,10 @@
     "@stablelib/aes": "^2.0.1",
     "@stablelib/gcm": "^2.0.1",
     "@stablelib/sha256": "^2.0.2",
-    "@structured-world/structured-zstd": "^0.2.6"
+    "@structured-world/structured-zstd": "^0.4.4"
   },
   "devDependencies": {
-    "@types/node": "^26.6.10",
+    "@types/node": "^26.6.11",
     "typescript": "^7.0.2",
     "vitest": "^5.1.2"
   }
